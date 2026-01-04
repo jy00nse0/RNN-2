@@ -342,6 +342,11 @@ def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_v
 
             # Decode only the first item in the batch
             src_seq_1 = question[:, 0:1].to(device)  # keep batch dimension = 1
+            
+            # Handle potential empty sequence if filtering removed everything
+            if src_seq_1.size(0) == 0:
+                continue
+
             pred_token_ids = _greedy_decode_sequence(
                 model=model,
                 src_seq_1=src_seq_1,

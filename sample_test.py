@@ -27,7 +27,7 @@ TEST_TGT = os.path.join(RAW_DATA_DIR, "test.de")
 ###############################################################################
 # 2. 샘플 데이터셋 생성
 ###############################################################################
-def make_sample_dataset(num_lines=500000):
+def make_sample_dataset(num_lines=5000):
     """
     Create a small sample dataset for quick testing.
     Using 1000 lines instead of 100k for reasonable testing time.
@@ -106,7 +106,7 @@ def run_sample_training():
         f"python train.py "
         f"--dataset sample100k "
         f"--save-path {save_path} "
-        f"--max-epochs 10 "
+        f"--max-epochs 4 "
         f"--batch-size 100 "
         f"--learning-rate 1.0 "
         f"--encoder-hidden-size 1000 "
@@ -161,7 +161,7 @@ def run_sample_evaluation():
         f"python calculate_bleu.py "
         f"--model-path {model_path} "
         f"--reference-path {ref_path} "
-        f"--epoch 10 "
+        f"--epoch 4 "
         f"--cuda"
     )
 

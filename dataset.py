@@ -22,6 +22,90 @@ class Vocab:
     def decode(self, indices):
         return [self.itos[idx] for idx in indices]
 
+class LazyTranslationDataset(Dataset):
+    """
+    Lazy loading dataset for translation tasks.
+    Indexes file offsets on initialization and reads lines on-demand.
+    Minimal memory footprint suitable for multiprocessing.
+    """
+    def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False):
+        self.src_file = src_file
+        self.tgt_file = tgt_file
+        self.reverse_src = reverse_src
+        
+        # 1. Build line offsets
+        print(f"Indexing {src_file}...")
+        self.src_offsets = self._build_offsets(src_file)
+        print(f"Indexing {tgt_file}...")
+        self.tgt_offsets = self._build_offsets(tgt_file)
+        
+        assert len(self.src_offsets) == len(self.tgt_offsets), \
+            f"Line count mismatch: SRC {len(self.src_offsets)} vs TGT {len(self.tgt_offsets)}"
+        
+        # 2. Build or use provided vocabularies
+        # To build vocab, we must scan the file once.
+        if src_vocab is None:
+            print("Building source vocabulary...")
+            src_tokens = self._scan_for_vocab(src_file, reverse_src)
+            self.src_vocab = Vocab(src_tokens)
+        else:
+            self.src_vocab = src_vocab
+            
+        if tgt_vocab is None:
+            print("Building target vocabulary...")
+            tgt_tokens = self._scan_for_vocab(tgt_file, False)
+            self.tgt_vocab = Vocab(tgt_tokens)
+        else:
+            self.tgt_vocab = tgt_vocab
+            
+    def _build_offsets(self, path):
+        offsets = [0]
+        with open(path, 'rb') as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                offsets.append(f.tell())
+        # Remove last offset which points to EOF
+        offsets.pop() 
+        return torch.tensor(offsets, dtype=torch.long)
+    
+    def _scan_for_vocab(self, path, reverse):
+        all_tokens = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                tokens = line.strip().split()
+                if reverse:
+                    # Reversing doesn't change the set of tokens, but good for consistency
+                    # Actually for vocab building order doesn't matter unless using special construction
+                    pass 
+                all_tokens.extend(tokens)
+        return all_tokens
+
+    def _read_line(self, path, offset):
+        with open(path, 'r', encoding='utf-8') as f:
+            f.seek(offset)
+            return f.readline().strip().split()
+
+    def __len__(self):
+        return len(self.src_offsets)
+    
+    def __getitem__(self, idx):
+        # 1. Read Source
+        src_tokens = self._read_line(self.src_file, self.src_offsets[idx].item())
+        if self.reverse_src:
+            src_tokens = list(reversed(src_tokens))
+        src = src_tokens + ['<eos>']
+        
+        # 2. Read Target
+        tgt_tokens = self._read_line(self.tgt_file, self.tgt_offsets[idx].item())
+        tgt = ['<sos>'] + tgt_tokens + ['<eos>']
+        
+        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
+        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
+        
+        return src_indices, tgt_indices
+
 class TranslationDataset(Dataset):
     """Dataset for translation tasks"""
     def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False):
@@ -135,14 +219,18 @@ def dataset_factory(args, device):
         print("Source sentence reversal:  ENABLED (dynamic)")
     
     # Load training data first to build vocabulary
-    train_dataset = TranslationDataset(
+    # Load training data first to build vocabulary
+    # Use LazyTranslationDataset for WMT datasets to save memory
+    DatasetClass = LazyTranslationDataset if 'wmt' in args.dataset.lower() else TranslationDataset
+    
+    train_dataset = DatasetClass(
         os.path.join(data_dir, f'train.{src_ext}'),
         os.path.join(data_dir, f'train.{tgt_ext}'),
         reverse_src=reverse_src
     )
     
     # Use training vocab for validation and test
-    val_dataset = TranslationDataset(
+    val_dataset = DatasetClass(
         os.path.join(data_dir, f'valid.{src_ext}'),
         os.path.join(data_dir, f'valid.{tgt_ext}'),
         src_vocab=train_dataset.src_vocab,
@@ -150,7 +238,7 @@ def dataset_factory(args, device):
         reverse_src=reverse_src
     )
     
-    test_dataset = TranslationDataset(
+    test_dataset = DatasetClass(
         os.path.join(data_dir, f'test.{src_ext}'),
         os.path.join(data_dir, f'test.{tgt_ext}'),
         src_vocab=train_dataset.src_vocab,
