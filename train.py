@@ -1,3 +1,5 @@
+# 모델 학습 메인 코드
+
 #!/usr/bin/env python3
 
 import os
