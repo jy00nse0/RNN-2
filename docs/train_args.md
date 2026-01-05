@@ -1,4 +1,4 @@
-# =============================================================================
+### =============================================================================
 # Args (CLI options) quick guide
 #
 ## [Paper hyperparameters]
@@ -81,5 +81,5 @@
  --half-window-size (int, default=10)
    local attention에서 window D (Luong et al.)
  --local-p-hidden-size (int, default=1000)
-# --concat-attention-hidden-size (int, default=1000)
-# =============================================================================
+ --concat-attention-hidden-size (int, default=1000)
+#### =============================================================================
