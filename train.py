@@ -1,5 +1,5 @@
 # 모델 학습 메인 코드
-
+# arg는 docs/train_args.md 참고
 #!/usr/bin/env python3
 
 import os
