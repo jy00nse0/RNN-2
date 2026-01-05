@@ -1,3 +1,5 @@
+# 샘플 데이터 생성 및 모델 학습, 평가
+
 #!/usr/bin/env python3
 import os
 import subprocess
