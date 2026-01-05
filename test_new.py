@@ -466,7 +466,7 @@ def main():
             print(f"Training already completed ({completed_epochs}/{max_epochs} epochs). Skipping.")
         else:
             # 3. 학습 명령 구성
-            cmd = f"python train.py --dataset {config['dataset']} --save-path {save_path}" + common_flags + " --num-workers 128"
+            cmd = f"python train.py --dataset {config['dataset']} --save-path {save_path}" + common_flags + " --num-workers 0"
             
             # Resume 플래그 추가
             if checkpoint_path:  
@@ -484,48 +484,36 @@ def main():
                 else: 
                     cmd += f" {flag_name} {value}"
 
-            # 4. 학습 실행 with epoch-by-epoch BLEU evaluation
+            # 4. 학습 실행 (Train directly to max_epochs)
             try:
-                print(f"Training started with per-epoch BLEU evaluation...")
+                print(f"Training started (target: {max_epochs} epochs)...")
                 
-                # Open BLEU log file in append mode
+                # Run training completely
+                run_command(cmd, log_path=None)
+                
+                # Evaluate BLEU only for the final epoch
+                print(f">>> Evaluating BLEU for Final Epoch {max_epochs}...")
+                bleu_score = evaluate_bleu(save_path, ref_file, max_epochs, common_flags)
+                
+                # Log result
                 with open(bleu_log_file, 'a') as bleu_log:
-                    # Write header if starting fresh
                     if completed_epochs == 0:
                         bleu_log.write(f"Experiment: {exp_name}\n")
-                        bleu_log. write(f"Dataset: {config['dataset']}\n")
+                        bleu_log.write(f"Dataset: {config['dataset']}\n")
                         bleu_log.write(f"{'='*60}\n")
-                        bleu_log.flush()
                     
-                    # Train one epoch at a time
-                    for epoch in range(completed_epochs + 1, max_epochs + 1):
-                        print(f"\n>>> Training Epoch {epoch}/{max_epochs}")
-                        
-                        # Modify command to train only one epoch
-                        epoch_cmd = cmd.replace(f"--max-epochs {max_epochs}", f"--max-epochs {epoch}")
-                        
-                        # Run training
-                        run_command(epoch_cmd, log_path=None)
-                        
-                        # Evaluate BLEU after this epoch
-                        print(f">>> Evaluating BLEU for Epoch {epoch}...")
-                        bleu_score = evaluate_bleu(save_path, ref_file, epoch, common_flags)
-                        
-                        # Log result
-                        if bleu_score is not None: 
-                            log_line = f"Epoch {epoch: 2d}:  BLEU = {bleu_score}\n"
-                            print(f"    {log_line. strip()}")
-                            bleu_log.write(log_line)
-                            bleu_log. flush()
-                        else: 
-                            log_line = f"Epoch {epoch:2d}:  BLEU evaluation failed\n"
-                            print(f"    {log_line. strip()}")
-                            bleu_log.write(log_line)
-                            bleu_log.flush()
+                    if bleu_score is not None: 
+                        log_line = f"Epoch {max_epochs: 2d}:  BLEU = {bleu_score}\n"
+                        print(f"    {log_line.strip()}")
+                        bleu_log.write(log_line)
+                    else: 
+                        log_line = f"Epoch {max_epochs:2d}:  BLEU evaluation failed\n"
+                        print(f"    {log_line.strip()}")
+                        bleu_log.write(log_line)
                 
                 print("Training completed successfully.")
             except subprocess.CalledProcessError as e:
-                print(f"! !! Error during training {exp_name}.")
+                print(f"!!! Error during training {exp_name}.")
                 print(f"    Command: {cmd}")
                 continue
         # ================================================================
