@@ -1,5 +1,3 @@
-# 모델 학습 메인 코드
-# arg는 docs/train_args.md 참고
 #!/usr/bin/env python3
 
 import os
@@ -59,6 +57,9 @@ def parse_args():
     # [Paper] LR Decay Start: 5 (Base) or 8 (Dropout)
     parser.add_argument('--lr-decay-start', type=int, default=5, 
                        help='Epoch after which to start halving learning rate. (Base: 5, Dropout: 8)')
+    # [Paper] Maximum sequence length for training (Truncation)
+    parser.add_argument('--max-seq-len', type=int, default=50,
+                       help='Maximum sequence length for source and target sentences (default: 50).')
     
     # ===== Training Configuration =====
     parser.add_argument('--train-embeddings', action='store_true', default=True, 
@@ -66,7 +67,7 @@ def parse_args():
     parser.add_argument('--embedding-type', type=str, default=None)
     parser.add_argument('--save-path', default='.save',
                        help='Folder where models (and other configs) will be saved during training.')
-    parser.add_argument('--save-every-epoch', action='store_true',
+    parser.add_argument('--save-every-epoch', action='store_true',default=True,
                        help='Save model every epoch regardless of validation loss.')
     parser.add_argument('--dataset', 
                        choices=['twitter-applesupport', 'twitter-amazonhelp', 'twitter-delta',
@@ -237,7 +238,7 @@ def batch_reverse_source(src_tensor, pad_idx, batch_first=False):
     return rev_src
 
 
-# Constants for monitoring
+# Constants for monitorig
 MAX_LOSS_FOR_PERPLEXITY = 100  # Cap for preventing overflow in perplexity calculation
 
 
@@ -281,14 +282,15 @@ def _get_special_token_indices(tgt_metadata, tgt_vocab):
     return sos_idx, eos_idx
 
 
-def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len):
+def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_length=None):
     """
     Greedy decode a single example (batch size = 1) with early stopping on <eos>.
     Args:
-        model: seq2seq model with forward(question, answer)
+        model: seq2seq model with forward(question, answer, src_lengths)
         src_seq_1: Tensor of shape (src_len, 1) for a single example
         sos_idx, eos_idx: indices for special tokens
         max_len: maximum generated tokens (excluding <sos>)
+        src_length: Tensor of shape (1,) for source length
     Returns:
         List[int]: generated target token ids (without <sos>, and excluding <eos>)
     """
@@ -300,7 +302,8 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len):
     # Iteratively decode next tokens
     for _ in range(max_len):
         # Forward pass with the current partial target (teacher forcing disabled)
-        logits = model(src_seq_1, tgt_seq)            # (tgt_len-1, 1, vocab)
+        # Pass src_lengths if provided
+        logits = model(src_seq_1, tgt_seq, src_lengths=src_length)            # (tgt_len-1, 1, vocab)
         step_logit = logits[-1, 0]                    # last step for next token
         next_token = int(step_logit.argmax(dim=-1).item())
 
@@ -349,12 +352,16 @@ def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_v
             if src_seq_1.size(0) == 0:
                 continue
 
+            # Prepare lengths for greedy decode (shape (1,))
+            src_length = batch.src_lengths[0:1] # Keep it as tensor (1,)
+
             pred_token_ids = _greedy_decode_sequence(
                 model=model,
                 src_seq_1=src_seq_1,
                 sos_idx=sos_idx,
                 eos_idx=eos_idx,
-                max_len=max_len
+                max_len=max_len,
+                src_length=src_length
             )
 
             # Prepare tokens for display
@@ -410,7 +417,7 @@ def evaluate(model, val_iter, metadata, reverse_src=False, verbose=False, collec
             # if reverse_src:
             #     question = batch_reverse_source(question, metadata.padding_idx)
             
-            logits = model(question, answer)
+            logits = model(question, answer, batch.src_lengths)
             
             # [OPTIMIZED] reshape() instead of view() - safer, handles non-contiguous tensors
             loss = F.cross_entropy(
@@ -440,7 +447,7 @@ def evaluate(model, val_iter, metadata, reverse_src=False, verbose=False, collec
 
 
 def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False, 
-          use_amp=False, scaler=None, epoch=0, save_path=None, vocab=None, 
+          use_amp=False, scaler=None, epoch=0, save_path=None, vocab=None, src_vocab=None,
           debug=False, log_interval=100, collect_loss_history=False):
     """
     [OPTIMIZED] Train model for one epoch.
@@ -462,7 +469,8 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
         scaler: GradScaler for AMP (required if use_amp=True)
         epoch: Current epoch number
         save_path: Path to save training metrics
-        vocab: Vocabulary for logging
+        vocab: Target vocabulary for logging
+        src_vocab: Source vocabulary for logging (optional)
         debug: Enable per-batch logging
         log_interval: Batch interval for logging
         collect_loss_history: Whether to collect batch-level loss history
@@ -487,6 +495,34 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
     
     for batch_idx, batch in enumerate(tqdm(train_iter, desc="Training", leave=False)):
         question, answer = batch.question, batch.answer
+
+        # [DEBUG] Check data pairing
+        if batch_idx == 0 and src_vocab is not None and vocab is not None:
+             print("\n" + "=" * 50)
+             print("DEBUG: Checking data pairing (First Batch)")
+             # access first sample
+             src_sample = question[:, 0]  # (seq_len)
+             tgt_sample = answer[:, 0]    # (seq_len)
+             
+             src_text = []
+             for token in src_sample:
+                 idx = token.item()
+                 if 0 <= idx < len(src_vocab.itos):
+                      word = src_vocab.itos[idx]
+                      if word not in ['<pad>']:
+                           src_text.append(word)
+             
+             tgt_text = []
+             for token in tgt_sample:
+                 idx = token.item()
+                 if 0 <= idx < len(vocab.itos):
+                      word = vocab.itos[idx]
+                      if word not in ['<pad>']:
+                           tgt_text.append(word)
+
+             print(f"SRC: {' '.join(src_text)}")
+             print(f"TGT: {' '.join(tgt_text)}")
+             print("=" * 50 + "\n")
         
         # [Feature] Reverse Source if flag is set
         # if reverse_src:
@@ -494,7 +530,7 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
         
         # [OPTIMIZED] AMP context (no-op if use_amp=False)
         with autocast(enabled=use_amp):
-            logits = model(question, answer)
+            logits = model(question, answer, batch.src_lengths)
             # Shifted labels: remove <sos>
             target_label = answer[1:]  # (tgt_len-1, batch)
             # [OPTIMIZED] reshape() instead of view()
@@ -661,6 +697,20 @@ def main():
             if epoch > args.lr_decay_start:
                 adjust_learning_rate(optimizer, epoch, args.lr_decay_start)
 
+            # [Feature] Teacher Forcing Scheduling: Linear decay
+            # Decay by 0.1 per epoch starting from epoch 1 (1.0 -> 0.9 -> 0.8 ...)
+            if epoch > 0:
+                decay_amount = 0.1
+                # Calculate new ratio based on initial ratio from args
+                new_ratio = args.teacher_forcing_ratio - (epoch * decay_amount)
+                new_ratio = max(0.0, new_ratio)
+                model.teacher_forcing_ratio = new_ratio
+                print(f"Teacher forcing ratio decayed to: {model.teacher_forcing_ratio:.2f}")
+            else:
+                 # Ensure it starts at the arg value (or reset if needed)
+                 model.teacher_forcing_ratio = args.teacher_forcing_ratio
+
+
             # Train for one epoch
             train_loss, train_stats = train(
                 model=model,
@@ -674,6 +724,7 @@ def main():
                 epoch=epoch,
                 save_path=args.save_path,
                 vocab=tgt_vocab,
+                src_vocab=src_vocab,
                 debug=args.debug,
                 log_interval=args.log_interval,
                 collect_loss_history=args.plot_loss_graph
