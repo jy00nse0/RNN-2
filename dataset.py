@@ -1,10 +1,11 @@
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
 from collections import Counter
 from util import Metadata
 import html
+import random
 
 
 class Vocab:
@@ -34,6 +35,73 @@ def limit_vocab(tokens_iterator, max_size=50000):
     most_common = counter.most_common(max_size)
     # Return list of tokens
     return [token for token, count in most_common]
+
+
+class BucketBatchSampler(Sampler):
+    """
+    Length-bucketed batch sampler for efficient training with variable-length sequences.
+    
+    Groups examples by similar sequence lengths and shuffles batch order each epoch.
+    This reduces padding and improves training throughput for RNN models.
+    
+    Args:
+        dataset: Dataset with 'lengths' attribute (list/tensor of sequence lengths)
+        batch_size: Number of samples per batch
+        drop_last: Whether to drop the last incomplete batch (default: False)
+        shuffle: Whether to shuffle batch order (default: True for training)
+        seed: Random seed for reproducibility (default: 42)
+    
+    Usage:
+        To enable bucketing in dataset_factory, use:
+        - args.use_bucketing = True
+        - args.bucket_by = 'src' or 'tgt' (which sequence to bucket by)
+    """
+    
+    def __init__(self, dataset, batch_size, drop_last=False, shuffle=True, seed=42):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        
+        # Get lengths from dataset
+        if not hasattr(dataset, 'lengths'):
+            raise ValueError("Dataset must have 'lengths' attribute for bucketing")
+        
+        self.lengths = dataset.lengths
+        
+        # Sort indices by length (short to long)
+        sorted_indices = sorted(range(len(self.lengths)), key=lambda i: self.lengths[i])
+        
+        # Group into batches
+        self.batches = []
+        for i in range(0, len(sorted_indices), batch_size):
+            batch = sorted_indices[i:i + batch_size]
+            if len(batch) == batch_size or not drop_last:
+                self.batches.append(batch)
+    
+    def set_epoch(self, epoch):
+        """Set the epoch for this sampler to shuffle batches differently each epoch."""
+        self.epoch = epoch
+    
+    def __iter__(self):
+        # Shuffle batch order if requested
+        if self.shuffle:
+            # Use epoch-specific seed for different shuffle each epoch
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.batches), generator=g).tolist()
+            batches = [self.batches[i] for i in indices]
+        else:
+            batches = self.batches
+        
+        for batch in batches:
+            yield batch
+    
+    def __len__(self):
+        return len(self.batches)
+
 
 class LazyTranslationDataset(Dataset):
     """
@@ -75,6 +143,70 @@ class LazyTranslationDataset(Dataset):
             self.tgt_vocab = Vocab(tgt_tokens_limited)
         else:
             self.tgt_vocab = tgt_vocab
+        
+        # 3. Pre-compute lengths for bucketing (lazy: scan file)
+        # Lengths are not computed by default to save memory and time
+        self._lengths_src = None
+        self._lengths_tgt = None
+            
+    def _compute_lengths(self, path, key='src'):
+        """
+        Compute sequence lengths by scanning the file.
+        Called lazily when lengths are needed for bucketing.
+        
+        Args:
+            path: File path to scan
+            key: 'src' or 'tgt' to indicate which file
+        
+        Returns:
+            torch.Tensor of sequence lengths
+        """
+        lengths = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                tokens = line.strip().split()
+                # Account for added special tokens (<eos> for src, <sos>+<eos> for tgt)
+                if key == 'src':
+                    length = min(len(tokens), self.max_len) + 1  # +1 for <eos>
+                else:  # tgt
+                    length = min(len(tokens), self.max_len) + 2  # +2 for <sos> and <eos>
+                lengths.append(length)
+        return torch.tensor(lengths, dtype=torch.long)
+    
+    @property
+    def lengths(self):
+        """
+        Get sequence lengths for bucketing.
+        By default, returns source lengths. Can be configured via bucket_by parameter.
+        """
+        # Return source lengths by default
+        if self._lengths_src is None:
+            print(f"Computing source lengths for bucketing...")
+            self._lengths_src = self._compute_lengths(self.src_file, key='src')
+        return self._lengths_src
+    
+    def get_lengths(self, key='src'):
+        """
+        Get lengths for a specific key (src or tgt).
+        
+        Args:
+            key: 'src' or 'tgt'
+        
+        Returns:
+            torch.Tensor of sequence lengths
+        """
+        if key == 'src':
+            if self._lengths_src is None:
+                print(f"Computing source lengths for bucketing...")
+                self._lengths_src = self._compute_lengths(self.src_file, key='src')
+            return self._lengths_src
+        elif key == 'tgt':
+            if self._lengths_tgt is None:
+                print(f"Computing target lengths for bucketing...")
+                self._lengths_tgt = self._compute_lengths(self.tgt_file, key='tgt')
+            return self._lengths_tgt
+        else:
+            raise ValueError(f"Invalid key '{key}'. Must be 'src' or 'tgt'")
             
     def _build_offsets(self, path):
         offsets = [0]
@@ -175,6 +307,51 @@ class TranslationDataset(Dataset):
             self.tgt_vocab = Vocab(limited_tokens)
         else:
             self.tgt_vocab = tgt_vocab
+        
+        # Pre-compute lengths for bucketing
+        self._lengths_src = None
+        self._lengths_tgt = None
+    
+    @property
+    def lengths(self):
+        """
+        Get sequence lengths for bucketing.
+        By default, returns source lengths. Can be configured via bucket_by parameter.
+        """
+        # Return source lengths by default
+        if self._lengths_src is None:
+            self._lengths_src = torch.tensor([
+                min(len(sent), self.max_len) + 1  # +1 for <eos>
+                for sent in self.src_sentences
+            ], dtype=torch.long)
+        return self._lengths_src
+    
+    def get_lengths(self, key='src'):
+        """
+        Get lengths for a specific key (src or tgt).
+        
+        Args:
+            key: 'src' or 'tgt'
+        
+        Returns:
+            torch.Tensor of sequence lengths
+        """
+        if key == 'src':
+            if self._lengths_src is None:
+                self._lengths_src = torch.tensor([
+                    min(len(sent), self.max_len) + 1  # +1 for <eos>
+                    for sent in self.src_sentences
+                ], dtype=torch.long)
+            return self._lengths_src
+        elif key == 'tgt':
+            if self._lengths_tgt is None:
+                self._lengths_tgt = torch.tensor([
+                    min(len(sent), self.max_len) + 2  # +2 for <sos> and <eos>
+                    for sent in self.tgt_sentences
+                ], dtype=torch.long)
+            return self._lengths_tgt
+        else:
+            raise ValueError(f"Invalid key '{key}'. Must be 'src' or 'tgt'")
     
     def __len__(self):
         return len(self.src_sentences)
@@ -348,18 +525,56 @@ def dataset_factory(args, device):
     
     print(f"Vocab size: SRC={len(train_dataset.src_vocab)}, TGT={len(train_dataset.tgt_vocab)}")
     
+    # Bucketing configuration
+    use_bucketing = getattr(args, 'use_bucketing', False)
+    bucket_by = getattr(args, 'bucket_by', 'src')  # 'src' or 'tgt'
+    bucket_drop_last = getattr(args, 'bucket_drop_last', False)
+    bucket_seed = getattr(args, 'bucket_seed', 42)
+    
+    if use_bucketing:
+        print(f"Bucketing enabled: bucket_by={bucket_by}, drop_last={bucket_drop_last}, seed={bucket_seed}")
+    
     # Create DataLoaders
     # Note: assume shared specials so pad_idx is 0 for both; use TGT pad_idx for loss
     pad_idx_src = train_dataset.src_vocab.stoi.get('<pad>', 0)
     pad_idx_tgt = train_dataset.tgt_vocab.stoi.get('<pad>', 0)
-    train_iter = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # [Correction] Training data must be shuffled
-        collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
-        num_workers=getattr(args, 'num_workers', 0),
-        pin_memory=True if torch.cuda.is_available() else False
-    )
+    
+    # Setup bucketing for training if enabled
+    if use_bucketing:
+        # Pre-compute lengths based on bucket_by key
+        if bucket_by == 'tgt':
+            train_dataset._lengths_tgt = train_dataset.get_lengths('tgt')
+            # Set the default lengths property to use target lengths
+            train_dataset._lengths_src = train_dataset.get_lengths('tgt')
+        else:
+            # Default: bucket by source length
+            train_dataset._lengths_src = train_dataset.get_lengths('src')
+        
+        # Create batch sampler for training
+        train_batch_sampler = BucketBatchSampler(
+            train_dataset,
+            batch_size=args.batch_size,
+            drop_last=bucket_drop_last,
+            shuffle=True,  # Shuffle batch order for training
+            seed=bucket_seed
+        )
+        
+        train_iter = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
+            num_workers=getattr(args, 'num_workers', 0),
+            pin_memory=True if torch.cuda.is_available() else False
+        )
+    else:
+        train_iter = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,  # [Correction] Training data must be shuffled
+            collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
+            num_workers=getattr(args, 'num_workers', 0),
+            pin_memory=True if torch.cuda.is_available() else False
+        )
     
     val_iter = DataLoader(
         val_dataset,
@@ -412,6 +627,11 @@ class BatchWrapper:
     
     def __len__(self):
         return len(self.dataloader)
+    
+    @property
+    def batch_sampler(self):
+        """Access the underlying batch_sampler if present."""
+        return getattr(self.dataloader, 'batch_sampler', None)
 
 # Field 생성을 위한 factory (기존 코드 호환용, 필요시 사용)
 def field_factory(args):
