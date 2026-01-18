@@ -559,18 +559,32 @@ def dataset_factory(args, device):
     
     # Setup bucketing for training if enabled
     if use_bucketing:
-        # Pre-compute lengths based on bucket_by key
-        if bucket_by == 'tgt':
-            train_dataset._lengths_tgt = train_dataset.get_lengths('tgt')
-            # Set the default lengths property to use target lengths
-            train_dataset._lengths_src = train_dataset.get_lengths('tgt')
-        else:
-            # Default: bucket by source length
-            train_dataset._lengths_src = train_dataset.get_lengths('src')
+        # Pre-compute lengths based on bucket_by key and store for sampler
+        bucketing_lengths = train_dataset.get_lengths(bucket_by)
+        # Temporarily set this as the default lengths for the sampler
+        train_dataset._bucketing_lengths = bucketing_lengths
+        
+        # Create a wrapper that exposes bucketing_lengths as 'lengths'
+        class DatasetWithBucketingLengths:
+            def __init__(self, dataset, lengths):
+                self._dataset = dataset
+                self.lengths = lengths
+            
+            def __getattr__(self, name):
+                return getattr(self._dataset, name)
+            
+            def __len__(self):
+                return len(self._dataset)
+            
+            def __getitem__(self, idx):
+                return self._dataset[idx]
+        
+        # Wrap the dataset to expose the correct lengths
+        dataset_for_bucketing = DatasetWithBucketingLengths(train_dataset, bucketing_lengths)
         
         # Create batch sampler for training
         train_batch_sampler = BucketBatchSampler(
-            train_dataset,
+            dataset_for_bucketing,
             batch_size=args.batch_size,
             drop_last=bucket_drop_last,
             shuffle=True,  # Shuffle batch order for training
@@ -578,7 +592,7 @@ def dataset_factory(args, device):
         )
         
         train_iter = DataLoader(
-            train_dataset,
+            train_dataset,  # Use original dataset for actual data loading
             batch_sampler=train_batch_sampler,
             collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
             num_workers=getattr(args, 'num_workers', 0),
