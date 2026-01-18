@@ -82,6 +82,27 @@ Key arguments:
 - `--reverse`: Reverse source sentences (recommended for better performance)
 - `--luong-input-feed`: Enable input feeding (for attention models)
 
+### Length-Bucketed Batching
+
+To improve training throughput by reducing padding, enable length-bucketed batching:
+
+```bash
+python train.py \
+  --dataset wmt14-en-de \
+  --use-bucketing \
+  --bucket-by src \
+  --batch-size 128 \
+  --cuda
+```
+
+Bucketing arguments:
+- `--use-bucketing`: Enable bucketing (groups sequences by similar lengths)
+- `--bucket-by`: Bucket by `src` (source) or `tgt` (target) length (default: `src`)
+- `--bucket-drop-last`: Drop last incomplete batch (default: False)
+- `--bucket-seed`: Random seed for batch shuffle (default: 42)
+
+Bucketing groups examples with similar sequence lengths into batches, reducing the amount of padding needed. The batch order is shuffled differently each epoch while keeping sequences within each batch grouped by length.
+
 ### Evaluation
 
 To calculate BLEU score on a trained model:

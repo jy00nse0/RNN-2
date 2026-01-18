@@ -432,6 +432,10 @@ def dataset_factory(args, device):
                 * 'sample100k': 샘플 데이터셋
             - args.reverse: Source 문장 역순 처리 여부 (동적)
             - args.batch_size: 배치 크기
+            - args.use_bucketing: Enable length-bucketed batching (default: False)
+            - args.bucket_by: Which sequence to bucket by ('src' or 'tgt', default: 'src')
+            - args.bucket_drop_last: Drop last incomplete batch (default: False)
+            - args.bucket_seed: Random seed for batch shuffling (default: 42)
         device: PyTorch device (CPU/GPU)
     
     Returns:
@@ -442,6 +446,20 @@ def dataset_factory(args, device):
         train_iter: 학습 데이터 반복자
         val_iter:  검증 데이터 반복자
         test_iter: 테스트 데이터 반복자
+    
+    Bucketing Usage:
+        To enable length-bucketed batching for training:
+        
+        ```python
+        args.use_bucketing = True      # Enable bucketing
+        args.bucket_by = 'src'          # Bucket by source length (or 'tgt' for target)
+        args.bucket_drop_last = False   # Keep all batches
+        args.bucket_seed = 42           # Random seed for reproducibility
+        ```
+        
+        Bucketing groups examples with similar lengths into batches, reducing
+        padding and improving training throughput. The batch order is shuffled
+        each epoch via set_epoch() called from train.py.
     """
     print(f"Loading data for {args.dataset}...")
 
