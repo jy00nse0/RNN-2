@@ -70,8 +70,13 @@ class Seq2SeqTrain(nn.Module):
         
         # Create encoder mask (batch, seq_len)
         # src_lengths: (batch)
-        max_src_len = question.size(0)
-        encoder_mask = torch.arange(max_src_len, device=question.device).expand(batch_size, max_src_len) < src_lengths.unsqueeze(1)
+        #max_src_len = question.size(0)
+        #encoder_mask = torch.arange(max_src_len, device=question.device).expand(batch_size, max_src_len) < src_lengths.unsqueeze(1)
+        # left pad implement
+        # question: (seq_len, batch)
+        seq_len = question.size(0)
+        # mask: (batch, seq_len) where True means valid token
+        encoder_mask = torch.arange(seq_len, device=question.device).unsqueeze(0) >= (seq_len - src_lengths).unsqueeze(1)
         
         # [DEBUG] Mask
         debug_tensor("Encoder Mask", encoder_mask, context="Seq2SeqTrain.forward", values=True)
