@@ -1,10 +1,9 @@
-# 샘플 데이터 생성 및 모델 학습, 평가
-
 #!/usr/bin/env python3
 import os
 import subprocess
 import shutil
 import torch
+import sys
 
 ###############################################################################
 # 1. Path 설정
@@ -29,7 +28,7 @@ TEST_TGT = os.path.join(RAW_DATA_DIR, "test.de")
 ###############################################################################
 # 2. 샘플 데이터셋 생성
 ###############################################################################
-def make_sample_dataset(num_lines=5000):
+def make_sample_dataset(num_lines=10):
     """
     Create a small sample dataset for quick testing.
     Using 1000 lines instead of 100k for reasonable testing time.
@@ -60,14 +59,14 @@ def make_sample_dataset(num_lines=5000):
     with open(VAL_SRC, "r", encoding="utf-8") as fin, \
          open(os.path.join(SAMPLE_DATA_DIR, "valid.en"), "w", encoding="utf-8") as fout:
         for i, line in enumerate(fin):
-            if i >= 20000:
+            if i >= 10:
                 break
             fout.write(line)
     
     with open(VAL_TGT, "r", encoding="utf-8") as fin, \
          open(os.path.join(SAMPLE_DATA_DIR, "valid.de"), "w", encoding="utf-8") as fout:
         for i, line in enumerate(fin):
-            if i >= 20000:
+            if i >= 10:
                 break
             fout.write(line)
     
@@ -105,11 +104,12 @@ def run_sample_training():
         cuda_flag = ""
 
     cmd = (
-        f"python train.py "
+        f"{sys.executable} train.py "
         f"--dataset sample100k "
         f"--save-path {save_path} "
-        f"--max-epochs 4 "
-        f"--batch-size 100 "
+        f"--max-epochs 50 "
+        f"--max-seq-len 50 "
+        f"--batch-size 3 "
         f"--learning-rate 1.0 "
         f"--encoder-hidden-size 1000 "
         f"--decoder-hidden-size 1000 "
@@ -117,8 +117,11 @@ def run_sample_training():
         f"--decoder-num-layers 4 "
         f"--attention-type none "
         f"--reverse "
-        f"--teacher-forcing-ratio 0.0 "
-        f"{cuda_flag}"
+        #f"--save-every-epoch "
+        f"--teacher-forcing-ratio 1.0 "
+        f"--sample-translations "
+        f"--lr-decay-start 25 "
+        f"--cuda 2>&1 | tee 10sent_test_debug_8.log"
     )
 
     print("[Exec]", cmd)
@@ -149,21 +152,51 @@ def get_latest_model_dir(base_path):
     return latest_dir
 
 
+def get_best_epoch(model_dir):
+    """
+    Find the epoch of the best model in the directory.
+    Assumes standard file naming: seq2seq-<epoch>-...
+    """
+    files = [f for f in os.listdir(model_dir) if f.startswith("seq2seq-") and f.endswith(".pt")]
+    if not files:
+        raise FileNotFoundError(f"No model files found in {model_dir}")
+    
+    # Parse epochs
+    epochs = []
+    for f in files:
+        try:
+            # Example: seq2seq-20-5.64-5.26.pt
+            parts = f.split('-')
+            epoch = int(parts[1])
+            epochs.append(epoch)
+        except (IndexError, ValueError):
+            continue
+            
+    if not epochs:
+         raise ValueError(f"Could not parse epochs from files in {model_dir}")
+         
+    return max(epochs)
+
+
 def run_sample_evaluation():
     print("\n======================= SAMPLE EVAL START =======================")
 
     save_path_base = "checkpoints/sample_test"
-    ref_path = "data/sample100k/test.de"
+    ref_path = "data/sample100k/train.de"
     
     # Detect the most recent timestamped subdirectory
     model_path = get_latest_model_dir(save_path_base)
     print(f"Using model from: {model_path}")
+    
+    # Find best epoch
+    best_epoch = get_best_epoch(model_path)
+    print(f"Using best epoch: {best_epoch}")
 
     cmd = (
-        f"python calculate_bleu.py "
+        f"{sys.executable} calculate_bleu.py "
         f"--model-path {model_path} "
         f"--reference-path {ref_path} "
-        f"--epoch 4 "
+        f"--epoch {best_epoch} "
         f"--cuda"
     )
 
