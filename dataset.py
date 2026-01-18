@@ -56,7 +56,7 @@ class Vocab:
         return len(self.itos)
     
     def encode(self, tokens):
-        return [self.stoi. get(tok, self.unk_index) for tok in tokens]
+        return [self.stoi.get(tok, self.unk_index) for tok in tokens]
     
     def decode(self, indices):
         return [self.itos[idx] for idx in indices]
@@ -182,9 +182,11 @@ class LazyTranslationDataset(Dataset):
         
         print(f"Computing lengths for bucket batching...")
         lengths = []
+        # Convert offsets to list once for efficiency
+        offset_list = self.src_offsets.tolist()
         with open(self.src_file, 'r', encoding='utf-8') as f:
-            for offset in self.src_offsets:
-                f.seek(offset.item())
+            for offset in offset_list:
+                f.seek(offset)
                 line = f.readline().strip()
                 # Count tokens (will add <eos>, so +1)
                 token_count = len(line.split())
@@ -323,14 +325,14 @@ class TranslationDataset(Dataset):
         return len(self.src_sentences)
     
     def __getitem__(self, idx):
-        # 1. Source 처리: <sos> 제거
-        # Encoder는 문장을 읽기만 하면 되므로 시작 토큰 불필요
+        # 1. Source processing: No <sos> token needed
+        # Encoder only reads the sentence, so no start token required
         src_tokens = self.src_sentences[idx]
         if len(src_tokens) > self.max_len:
             src_tokens = src_tokens[:self.max_len]
         src = src_tokens + ['<eos>'] 
         
-        # 2. Target 처리: 학습용 전체 시퀀스 생성
+        # 2. Target processing: Generate full sequence for training
         tgt_tokens = self.tgt_sentences[idx]
         if len(tgt_tokens) > self.max_len:
             tgt_tokens = tgt_tokens[:self.max_len]
@@ -339,7 +341,7 @@ class TranslationDataset(Dataset):
         src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
         tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
         return src_indices, tgt_indices
-import torch
+
 
 def left_pad_sequence(seqs, padding_value, batch_first=False):
     """
@@ -350,12 +352,12 @@ def left_pad_sequence(seqs, padding_value, batch_first=False):
     lengths = torch.tensor([s.size(0) for s in seqs], dtype=torch.int64)
     max_len = int(lengths.max().item())
 
-    # dtype/device는 첫 샘플 기준(일반적으로 CPU long)
+    # dtype/device based on first sample (typically CPU long)
     out = seqs[0].new_full((len(seqs), max_len), fill_value=padding_value)  # (batch, max_len)
 
     for i, s in enumerate(seqs):
         l = s.size(0)
-        out[i, max_len - l:] = s  # 오른쪽에 실제 토큰을 붙임 => 왼쪽이 pad
+        out[i, max_len - l:] = s  # Actual tokens on right => padding on left
 
     if batch_first:
         return out, lengths
@@ -366,7 +368,7 @@ from torch.nn.utils.rnn import pad_sequence
 def collate_fn(batch, pad_idx_src, pad_idx_tgt, left_pad_src=True, left_pad_tgt=False):
     src_batch, tgt_batch = zip(*batch)
 
-    # lengths (패딩 전)
+    # lengths (before padding)
     src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.int64)
     tgt_lengths = torch.tensor([len(t) for t in tgt_batch], dtype=torch.int64)
 
@@ -384,27 +386,27 @@ def collate_fn(batch, pad_idx_src, pad_idx_tgt, left_pad_src=True, left_pad_tgt=
     return src_padded, tgt_padded, src_lengths, tgt_lengths
 def dataset_factory(args, device):
     """
-    WMT14/15 데이터셋 로더
+    WMT14/15 dataset loader
     Returns both SRC and TGT metadata/vocab.
     
     Args:
-        args: 학습 인자
-            - args.dataset: 데이터셋 이름
+        args: Training arguments
+            - args.dataset: Dataset name
                 * 'wmt14-en-de': WMT14 English→German
                 * 'wmt15-deen':  WMT15 German→English
-                * 'sample100k': 샘플 데이터셋
-            - args.reverse: Source 문장 역순 처리 여부 (동적)
-            - args.batch_size: 배치 크기
+                * 'sample100k': Sample dataset
+            - args.reverse: Whether to reverse source sentences (dynamic)
+            - args.batch_size: Batch size
         device: PyTorch device (CPU/GPU)
     
     Returns:
-        src_metadata: Source 메타정보 (vocab_size, padding_idx 등)
-        tgt_metadata: Target 메타정보 (vocab_size, padding_idx 등)
-        src_vocab: Source 언어 Vocabulary
-        tgt_vocab: Target 언어 Vocabulary
-        train_iter: 학습 데이터 반복자
-        val_iter:  검증 데이터 반복자
-        test_iter: 테스트 데이터 반복자
+        src_metadata: Source metadata (vocab_size, padding_idx, etc.)
+        tgt_metadata: Target metadata (vocab_size, padding_idx, etc.)
+        src_vocab: Source language Vocabulary
+        tgt_vocab: Target language Vocabulary
+        train_iter: Training data iterator
+        val_iter:  Validation data iterator
+        test_iter: Test data iterator
     """
     print(f"Loading data for {args.dataset}...")
 
@@ -579,7 +581,7 @@ class BatchWrapper:
     def __len__(self):
         return len(self.dataloader)
 
-# Field 생성을 위한 factory (기존 코드 호환용, 필요시 사용)
+# Field factory for backward compatibility (if needed)
 def field_factory(args):
     # Return a dummy object that won't be used
     return None
