@@ -4,7 +4,23 @@ import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 
+import torch
 
+def summarize_delta(w_before, w_after, name="", eps=0.0):
+    d = (w_after - w_before).detach().float().abs()
+    flat = d.view(-1)
+
+    # nonzero 기준: float 오차 감안해서 eps를 주는 게 좋음
+    nz = (flat > eps)
+    nz_ratio = nz.float().mean().item()
+
+    qs = torch.quantile(flat, torch.tensor([0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0], device=flat.device)).cpu().tolist()
+    print(f"\n[{name}] |delta| stats")
+    print(f"  shape: {tuple(d.shape)}  numel: {flat.numel():,}")
+    print(f"  mean: {flat.mean().item():.3e}  std: {flat.std(unbiased=False).item():.3e}")
+    print(f"  min:  {flat.min().item():.3e}  max: {flat.max().item():.3e}")
+    print(f"  nonzero ratio (>|{eps}|): {nz_ratio:.6f}")
+    print(f"  quantiles [0,25,50,75,90,99,100%]: {[f'{x:.3e}' for x in qs]}")
 def embedding_size_from_name(name):
     return int(name.strip().split('.')[-1][:-1])
 
@@ -100,7 +116,7 @@ class RNNWrapper(nn.Module):
         return rnn_out, hidden
     
 # Metadata used to describe dataset
-Metadata = collections.namedtuple('Metadata', 'vocab_size padding_idx vectors')
+Metadata = collections.namedtuple('Metadata', 'vocab_size padding_idx src_padding_idx vectors')
 
 # -------------------------------------------------------------------------
 # [New] Ground Truth Initialization
@@ -115,3 +131,23 @@ def init_weights(model):
     for name, param in model.named_parameters():
         # 바이어스와 웨이트 모두 uniform 초기화
         nn.init.uniform_(param.data, -0.1, 0.1)
+
+def count_nonzero_grad_vocab(grad_tensor, eps=0.0):
+    """
+    grad_tensor: Tensor of shape (vocab_size, embed_dim)
+    eps: threshold for numerical zero (use >0 for AMP/FP16 noise)
+    
+    Returns:
+        nonzero_count: grad sum이 0이 아닌 vocab 개수
+        grad_sums: 각 vocab별 grad sum (abs 기준)
+    """
+    if grad_tensor is None:
+        raise ValueError("grad_tensor is None (backward not called or no gradient)")
+
+    # vocab별 |grad| 합
+    grad_sums = grad_tensor.abs().sum(dim=1)  # (vocab_size,)
+
+    # 0이 아닌 vocab 개수
+    nonzero_count = (grad_sums > eps).sum().item()
+
+    return nonzero_count
