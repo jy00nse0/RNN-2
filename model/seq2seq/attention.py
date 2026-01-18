@@ -63,7 +63,7 @@ class Attention(ABC, nn.Module):
         self.attn_score = attn_score
 
     @abstractmethod
-    def forward(self, t, hidden, encoder_outputs):
+    def forward(self, t, hidden, encoder_outputs, mask=None):
         raise NotImplementedError
 
     def attn_weights(self, hidden, encoder_outputs, mask=None):
@@ -90,9 +90,9 @@ class GlobalAttention(Attention):
     def __init__(self, attn_score):
         super(GlobalAttention, self).__init__(attn_score)
 
-    def forward(self, t, hidden, encoder_outputs):
+    def forward(self, t, hidden, encoder_outputs, mask=None):
         # Global attention considers all encoder outputs
-        attn_weights = self.attn_weights(hidden, encoder_outputs)
+        attn_weights = self.attn_weights(hidden, encoder_outputs, mask=mask)
         return attn_weights, self.attn_context(attn_weights, encoder_outputs)
 
 
@@ -104,7 +104,7 @@ class LocalMonotonicAttention(Attention):
         super(LocalMonotonicAttention, self).__init__(attn_score)
         self.D = D
 
-    def forward(self, t, hidden, encoder_outputs):
+    def forward(self, t, hidden, encoder_outputs, mask=None):
         seq_len = encoder_outputs.size(0)
         # Slicing handles boundary checks automatically (ignores out of bounds)
         start = max(0, t - self.D)
@@ -112,7 +112,9 @@ class LocalMonotonicAttention(Attention):
         
         enc_out = encoder_outputs[start:end]
         
-        attn_weights = self.attn_weights(hidden, enc_out)
+        local_mask = mask[:, start:end] if mask is not None else None
+        
+        attn_weights = self.attn_weights(hidden, enc_out, mask=local_mask)
         return attn_weights, self.attn_context(attn_weights, enc_out)
 
 
@@ -133,7 +135,7 @@ class LocalPredictiveAttention(Attention):
         nn.init.uniform_(self.vp.weight, -0.1, 0.1)
         nn.init.uniform_(self.vp.bias, -0.1, 0.1)
 
-    def forward(self, t, hidden, encoder_outputs):
+    def forward(self, t, hidden, encoder_outputs, mask=None):
         seq_len = encoder_outputs.size(0)
         batch_size = encoder_outputs.size(1)
 
