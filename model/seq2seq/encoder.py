@@ -82,12 +82,7 @@ class SimpleEncoder(Encoder):
         if hasattr(self.embed, 'weight'):
             print(f"Embedding for token 10: {self.embed.weight[10]}")
         else:
-             # If embed is not a standard Embedding layer (e.g. customized), try forward pass
-             with torch.no_grad():
-                 dummy_idx = torch.LongTensor([10])
-                 if next(self.embed.parameters()).is_cuda:
-                     dummy_idx = dummy_idx.cuda()
-                 print(f"Embedding for token 10: {self.embed(dummy_idx)}")
+            print("no embedding")
         
 
     @property
@@ -158,3 +153,4 @@ class SimpleEncoder(Encoder):
         debug_tensor("Encoder Outputs", outputs, context="SimpleEncoder.forward")
         
         return outputs, h_n
+
