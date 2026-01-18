@@ -5,7 +5,6 @@ from torch.nn.utils.rnn import pad_sequence
 from collections import Counter
 from util import Metadata
 import html
-import random
 
 
 class Vocab:
@@ -559,10 +558,8 @@ def dataset_factory(args, device):
     
     # Setup bucketing for training if enabled
     if use_bucketing:
-        # Pre-compute lengths based on bucket_by key and store for sampler
+        # Pre-compute lengths based on bucket_by key
         bucketing_lengths = train_dataset.get_lengths(bucket_by)
-        # Temporarily set this as the default lengths for the sampler
-        train_dataset._bucketing_lengths = bucketing_lengths
         
         # Create a wrapper that exposes bucketing_lengths as 'lengths'
         class DatasetWithBucketingLengths:
@@ -602,7 +599,7 @@ def dataset_factory(args, device):
         train_iter = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,  # [Correction] Training data must be shuffled
+            shuffle=False,  # No shuffle when bucketing is disabled (maintains original behavior)
             collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
             num_workers=getattr(args, 'num_workers', 0),
             pin_memory=True if torch.cuda.is_available() else False
