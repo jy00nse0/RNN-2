@@ -91,6 +91,17 @@ def parse_args():
     parser.add_argument('--reverse', action='store_true', 
                        help='[Experiment] Reverse source sequence (excluding special tokens) for LSTM inputs.')
     
+    # ===== Bucketing Configuration =====
+    bucketing_args = parser.add_argument_group('Bucketing', 'Length-bucketed batching settings.')
+    bucketing_args.add_argument('--use-bucketing', action='store_true', default=False,
+                               help='Enable length-bucketed batching for training (reduces padding, improves throughput).')
+    bucketing_args.add_argument('--bucket-by', type=str, choices=['src', 'tgt'], default='src',
+                               help='Which sequence to bucket by: src (source) or tgt (target). Default: src.')
+    bucketing_args.add_argument('--bucket-drop-last', action='store_true', default=False,
+                               help='Drop last incomplete batch when bucketing.')
+    bucketing_args.add_argument('--bucket-seed', type=int, default=42,
+                               help='Random seed for bucketing batch shuffle. Default: 42.')
+    
     # ===== GPU Settings =====
     gpu_args = parser.add_argument_group('GPU', 'GPU related settings.')
     gpu_args.add_argument('--cuda', action='store_true', default=True, 
@@ -791,6 +802,13 @@ def main():
             print("=" * 70)
             
             start = datetime.now()
+            
+            # Set epoch for batch sampler (for bucketing with epoch-wise shuffle)
+            if hasattr(train_iter, 'batch_sampler') and train_iter.batch_sampler is not None:
+                if hasattr(train_iter.batch_sampler, 'set_epoch'):
+                    train_iter.batch_sampler.set_epoch(epoch)
+                    if args.debug:
+                        print(f"Batch sampler epoch set to {epoch}")
             
             # [Paper] LR Scheduling: Halve after specified epoch
             if epoch > args.lr_decay_start:
