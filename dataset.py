@@ -1,10 +1,47 @@
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
 from collections import Counter
 from util import Metadata
 import html
+import numpy as np
+
+"""
+Dataset module for Neural Machine Translation.
+
+Supports:
+- TranslationDataset: Eager-loading dataset (loads all data into memory)
+- LazyTranslationDataset: Memory-efficient dataset (reads on-demand from disk)
+- BucketBatchSampler: Length-bucketed batch sampling for efficient training
+
+LENGTH-BUCKETED BATCHING:
+=========================
+Bucket batching groups examples of similar length together to minimize padding,
+improving training efficiency and reducing wasted computation on padding tokens.
+
+Usage:
+------
+1. Enable in train.py with --bucket-batching flag:
+   
+   python train.py --dataset wmt14-en-de --bucket-batching
+   
+2. The sampler automatically:
+   - Sorts examples by source length (short to long)
+   - Groups them into batches of size batch_size
+   - Shuffles batch order each epoch (call set_epoch(epoch))
+   
+3. Works with both TranslationDataset and LazyTranslationDataset
+
+4. Validation/test sets remain deterministic (shuffle=False)
+
+Implementation:
+---------------
+- BucketBatchSampler: Handles length-based batching and epoch-wise shuffling
+- Dataset.compute_lengths(): Efficiently computes sequence lengths for bucketing
+- dataset_factory(): Creates appropriate DataLoader based on args.bucket_batching
+- train.py: Calls batch_sampler.set_epoch(epoch) before each training epoch
+"""
 
 
 class Vocab:
@@ -19,7 +56,7 @@ class Vocab:
         return len(self.itos)
     
     def encode(self, tokens):
-        return [self.stoi. get(tok, self.unk_index) for tok in tokens]
+        return [self.stoi.get(tok, self.unk_index) for tok in tokens]
     
     def decode(self, indices):
         return [self.itos[idx] for idx in indices]
@@ -34,6 +71,60 @@ def limit_vocab(tokens_iterator, max_size=50000):
     most_common = counter.most_common(max_size)
     # Return list of tokens
     return [token for token, count in most_common]
+
+
+class BucketBatchSampler(Sampler):
+    """
+    Length-bucketed batch sampler for efficient training.
+    
+    Sorts dataset indices by example length (short to long), forms batches
+    of size `batch_size`, and shuffles the order of batches per epoch using
+    `set_epoch(epoch)`.
+    
+    Usage:
+        Enable with args.bucket_batching=True in dataset_factory.
+        Call sampler.set_epoch(epoch) at the start of each training epoch.
+    
+    Args:
+        dataset_lengths: Tensor or list of sequence lengths for each example
+        batch_size: Number of examples per batch
+        drop_last: Whether to drop the last incomplete batch
+    """
+    def __init__(self, dataset_lengths, batch_size, drop_last=False):
+        self.dataset_lengths = dataset_lengths
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.epoch = 0
+        
+        # Sort indices by length (short to long)
+        # Convert to tensor for efficient sorting if needed
+        if not isinstance(dataset_lengths, torch.Tensor):
+            dataset_lengths = torch.tensor(dataset_lengths)
+        sorted_indices = torch.argsort(dataset_lengths).tolist()
+        
+        # Form batches from sorted indices
+        self.batches = []
+        for i in range(0, len(sorted_indices), batch_size):
+            batch = sorted_indices[i:i + batch_size]
+            if len(batch) == batch_size or not drop_last:
+                self.batches.append(batch)
+    
+    def set_epoch(self, epoch):
+        """Set epoch for shuffling batch order"""
+        self.epoch = epoch
+    
+    def __iter__(self):
+        # Shuffle batch order based on epoch (deterministic per epoch)
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+        indices = torch.randperm(len(self.batches), generator=g).tolist()
+        
+        for idx in indices:
+            yield self.batches[idx]
+    
+    def __len__(self):
+        return len(self.batches)
+
 
 class LazyTranslationDataset(Dataset):
     """
@@ -75,6 +166,36 @@ class LazyTranslationDataset(Dataset):
             self.tgt_vocab = Vocab(tgt_tokens_limited)
         else:
             self.tgt_vocab = tgt_vocab
+        
+        # Cached lengths for bucket batching (computed lazily on first access)
+        self._lengths_cache = None
+    
+    def compute_lengths(self):
+        """
+        Compute source sequence lengths for all examples efficiently.
+        Uses file offsets to read only line lengths without loading full text.
+        Returns tensor of lengths (including <eos> token).
+        """
+        if self._lengths_cache is not None:
+            return self._lengths_cache
+        
+        print(f"Computing lengths for bucket batching...")
+        lengths = []
+        # Convert offsets to list once for efficiency
+        offset_list = self.src_offsets.tolist()
+        with open(self.src_file, 'r', encoding='utf-8') as f:
+            for offset in offset_list:
+                f.seek(offset)
+                line = f.readline().strip()
+                # Count tokens (will add <eos>, so +1)
+                token_count = len(line.split())
+                # Apply max_len truncation
+                token_count = min(token_count, self.max_len)
+                # Add 1 for <eos> token
+                lengths.append(token_count + 1)
+        
+        self._lengths_cache = torch.tensor(lengths, dtype=torch.int64)
+        return self._lengths_cache
             
     def _build_offsets(self, path):
         offsets = [0]
@@ -125,8 +246,8 @@ class LazyTranslationDataset(Dataset):
             
         tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
-        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.int)
-        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.int)
+        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
+        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
         
         return src_indices, tgt_indices
 
@@ -175,31 +296,51 @@ class TranslationDataset(Dataset):
             self.tgt_vocab = Vocab(limited_tokens)
         else:
             self.tgt_vocab = tgt_vocab
+        
+        # Cached lengths for bucket batching (computed lazily on first access)
+        self._lengths_cache = None
+    
+    def compute_lengths(self):
+        """
+        Compute source sequence lengths for all examples efficiently.
+        Uses already-loaded sentence lists.
+        Returns tensor of lengths (including <eos> token).
+        """
+        if self._lengths_cache is not None:
+            return self._lengths_cache
+        
+        # Compute lengths from stored sentences
+        lengths = []
+        for src_sent in self.src_sentences:
+            # Apply max_len truncation
+            token_count = min(len(src_sent), self.max_len)
+            # Add 1 for <eos> token
+            lengths.append(token_count + 1)
+        
+        self._lengths_cache = torch.tensor(lengths, dtype=torch.int64)
+        return self._lengths_cache
     
     def __len__(self):
         return len(self.src_sentences)
     
     def __getitem__(self, idx):
-        # 1. Source 처리: <sos> 제거
-        # Encoder는 문장을 읽기만 하면 되므로 시작 토큰 불필요
+        # 1. Source processing: No <sos> token needed
+        # Encoder only reads the sentence, so no start token required
         src_tokens = self.src_sentences[idx]
         if len(src_tokens) > self.max_len:
             src_tokens = src_tokens[:self.max_len]
         src = src_tokens + ['<eos>'] 
         
-        # 2. Target 처리: 학습용 전체 시퀀스 생성
+        # 2. Target processing: Generate full sequence for training
         tgt_tokens = self.tgt_sentences[idx]
         if len(tgt_tokens) > self.max_len:
             tgt_tokens = tgt_tokens[:self.max_len]
         tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
-        #src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.int)
-        #tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.int)
-                
-        src_indices = torch.tensor(self.src_vocab.encode(src))
-        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt))
+        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
+        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
         return src_indices, tgt_indices
-import torch
+
 
 def left_pad_sequence(seqs, padding_value, batch_first=False):
     """
@@ -210,12 +351,12 @@ def left_pad_sequence(seqs, padding_value, batch_first=False):
     lengths = torch.tensor([s.size(0) for s in seqs], dtype=torch.int64)
     max_len = int(lengths.max().item())
 
-    # dtype/device는 첫 샘플 기준(일반적으로 CPU long)
+    # dtype/device based on first sample (typically CPU long)
     out = seqs[0].new_full((len(seqs), max_len), fill_value=padding_value)  # (batch, max_len)
 
     for i, s in enumerate(seqs):
         l = s.size(0)
-        out[i, max_len - l:] = s  # 오른쪽에 실제 토큰을 붙임 => 왼쪽이 pad
+        out[i, max_len - l:] = s  # Actual tokens on right => padding on left
 
     if batch_first:
         return out, lengths
@@ -226,7 +367,7 @@ from torch.nn.utils.rnn import pad_sequence
 def collate_fn(batch, pad_idx_src, pad_idx_tgt, left_pad_src=True, left_pad_tgt=False):
     src_batch, tgt_batch = zip(*batch)
 
-    # lengths (패딩 전)
+    # lengths (before padding)
     src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.int64)
     tgt_lengths = torch.tensor([len(t) for t in tgt_batch], dtype=torch.int64)
 
@@ -244,27 +385,27 @@ def collate_fn(batch, pad_idx_src, pad_idx_tgt, left_pad_src=True, left_pad_tgt=
     return src_padded, tgt_padded, src_lengths, tgt_lengths
 def dataset_factory(args, device):
     """
-    WMT14/15 데이터셋 로더
+    WMT14/15 dataset loader
     Returns both SRC and TGT metadata/vocab.
     
     Args:
-        args: 학습 인자
-            - args.dataset: 데이터셋 이름
+        args: Training arguments
+            - args.dataset: Dataset name
                 * 'wmt14-en-de': WMT14 English→German
                 * 'wmt15-deen':  WMT15 German→English
-                * 'sample100k': 샘플 데이터셋
-            - args.reverse: Source 문장 역순 처리 여부 (동적)
-            - args.batch_size: 배치 크기
+                * 'sample100k': Sample dataset
+            - args.reverse: Whether to reverse source sentences (dynamic)
+            - args.batch_size: Batch size
         device: PyTorch device (CPU/GPU)
     
     Returns:
-        src_metadata: Source 메타정보 (vocab_size, padding_idx 등)
-        tgt_metadata: Target 메타정보 (vocab_size, padding_idx 등)
-        src_vocab: Source 언어 Vocabulary
-        tgt_vocab: Target 언어 Vocabulary
-        train_iter: 학습 데이터 반복자
-        val_iter:  검증 데이터 반복자
-        test_iter: 테스트 데이터 반복자
+        src_metadata: Source metadata (vocab_size, padding_idx, etc.)
+        tgt_metadata: Target metadata (vocab_size, padding_idx, etc.)
+        src_vocab: Source language Vocabulary
+        tgt_vocab: Target language Vocabulary
+        train_iter: Training data iterator
+        val_iter:  Validation data iterator
+        test_iter: Test data iterator
     """
     print(f"Loading data for {args.dataset}...")
 
@@ -352,14 +493,40 @@ def dataset_factory(args, device):
     # Note: assume shared specials so pad_idx is 0 for both; use TGT pad_idx for loss
     pad_idx_src = train_dataset.src_vocab.stoi.get('<pad>', 0)
     pad_idx_tgt = train_dataset.tgt_vocab.stoi.get('<pad>', 0)
-    train_iter = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,  # [Correction] Training data must be shuffled
-        collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
-        num_workers=getattr(args, 'num_workers', 0),
-        pin_memory=True if torch.cuda.is_available() else False
-    )
+    
+    # Check if bucket batching is enabled
+    use_bucket_batching = getattr(args, 'bucket_batching', False)
+    
+    if use_bucket_batching:
+        print("Using length-bucketed batching for training data")
+        # Compute lengths for bucket batching
+        train_lengths = train_dataset.compute_lengths()
+        
+        # Create bucket batch sampler
+        bucket_sampler = BucketBatchSampler(
+            dataset_lengths=train_lengths,
+            batch_size=args.batch_size,
+            drop_last=False
+        )
+        
+        # Create DataLoader with batch_sampler (cannot use batch_size or shuffle)
+        train_iter = DataLoader(
+            train_dataset,
+            batch_sampler=bucket_sampler,
+            collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
+            num_workers=getattr(args, 'num_workers', 0),
+            pin_memory=True if torch.cuda.is_available() else False
+        )
+    else:
+        # Standard DataLoader with shuffle
+        train_iter = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,  # Enable shuffling for standard training
+            collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
+            num_workers=getattr(args, 'num_workers', 0),
+            pin_memory=True if torch.cuda.is_available() else False
+        )
     
     val_iter = DataLoader(
         val_dataset,
@@ -413,7 +580,7 @@ class BatchWrapper:
     def __len__(self):
         return len(self.dataloader)
 
-# Field 생성을 위한 factory (기존 코드 호환용, 필요시 사용)
+# Field factory for backward compatibility (if needed)
 def field_factory(args):
     # Return a dummy object that won't be used
     return None

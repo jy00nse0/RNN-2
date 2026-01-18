@@ -87,6 +87,10 @@ def parse_args():
     parser.add_argument('--teacher-forcing-decay', action='store_true', default=False,
                        help='Enable linear decay of teacher forcing ratio (1.0 -> 0.0).')
     
+    # [Data Loading] Bucket Batching
+    parser.add_argument('--bucket-batching', action='store_true', default=False,
+                       help='Enable length-bucketed batching: sorts examples by length, groups into batches, and shuffles batch order per epoch for more efficient training.')
+    
     # [Paper] Experimental Setup
     parser.add_argument('--reverse', action='store_true', 
                        help='[Experiment] Reverse source sequence (excluding special tokens) for LSTM inputs.')
@@ -811,6 +815,13 @@ def main():
                  # If decay is disabled, it stays constant at args.teacher_forcing_ratio
                  model.teacher_forcing_ratio = args.teacher_forcing_ratio
 
+            # [Bucket Batching] Set epoch for batch sampler shuffling
+            # Check if train_iter has a batch_sampler (wrapped in BatchWrapper)
+            if hasattr(train_iter, 'dataloader') and hasattr(train_iter.dataloader, 'batch_sampler'):
+                batch_sampler = train_iter.dataloader.batch_sampler
+                if hasattr(batch_sampler, 'set_epoch'):
+                    batch_sampler.set_epoch(epoch)
+                    print(f"Set batch sampler epoch to {epoch}")
 
             # Train for one epoch
             train_loss, train_stats = train(
