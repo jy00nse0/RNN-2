@@ -7,6 +7,42 @@ from util import Metadata
 import html
 import numpy as np
 
+"""
+Dataset module for Neural Machine Translation.
+
+Supports:
+- TranslationDataset: Eager-loading dataset (loads all data into memory)
+- LazyTranslationDataset: Memory-efficient dataset (reads on-demand from disk)
+- BucketBatchSampler: Length-bucketed batch sampling for efficient training
+
+LENGTH-BUCKETED BATCHING:
+=========================
+Bucket batching groups examples of similar length together to minimize padding,
+improving training efficiency and reducing wasted computation on padding tokens.
+
+Usage:
+------
+1. Enable in train.py with --bucket-batching flag:
+   
+   python train.py --dataset wmt14-en-de --bucket-batching
+   
+2. The sampler automatically:
+   - Sorts examples by source length (short to long)
+   - Groups them into batches of size batch_size
+   - Shuffles batch order each epoch (call set_epoch(epoch))
+   
+3. Works with both TranslationDataset and LazyTranslationDataset
+
+4. Validation/test sets remain deterministic (shuffle=False)
+
+Implementation:
+---------------
+- BucketBatchSampler: Handles length-based batching and epoch-wise shuffling
+- Dataset.compute_lengths(): Efficiently computes sequence lengths for bucketing
+- dataset_factory(): Creates appropriate DataLoader based on args.bucket_batching
+- train.py: Calls batch_sampler.set_epoch(epoch) before each training epoch
+"""
+
 
 class Vocab:
     """Simple vocabulary class"""
