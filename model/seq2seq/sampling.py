@@ -49,7 +49,21 @@ class GreedySampler(SequenceSampler):
         for t in range(max_length):
             output, _, kwargs = decoder(t, input_word, encoder_outputs, h_n, **kwargs)
             argmax = output.argmax(dim=1)  # (batch,)
+            # argmax = output.argmax(dim=1)  # (batch,)
+            # [Modified] Select 3rd highest probability token as per user request
+            #_, top_indices = output.topk(4, dim=1)
+            #argmax = top_indices[:, 1]  # Pick the 3rd (index 2) element
 
+            '''
+            # [DEBUG] Check if predicted token is <unk> (index 3 based on dataset.py)
+            # User request: print(next_token, tgt_vocab.stoi['<unk>']) verification
+            # Since we don't have vocab object here, we print the raw index.
+            # <unk> is typically index 3 in this codebase (pad=0, sos=1, eos=2, unk=3)
+            if t < 50 and batch_size == 128: # Only print for first few tokens of single batch to avoid spam
+                # Handle batch: just look at the first sample in the batch
+                first_pred = argmax[0].item()
+                print(f"[DEBUG] t={t}: Batch[0] Index={first_pred} (Is UNK(3)? {first_pred == 3})")
+            ''' 
             # 아직 끝나지 않은 샘플만 업데이트
             if (~finished).any():
                 sequences[~finished, t] = argmax[~finished]
@@ -76,6 +90,7 @@ class RandomSampler(SequenceSampler):
     EOS 생성 시 해당 샘플은 조기 종료하며, 모든 샘플이 종료되면 즉시 중단.
     """
     def sample(self, encoder_outputs, h_n, decoder, sos_idx, eos_idx, max_length):
+        print("using random...")
         batch_size = encoder_outputs.size(1)
         device = encoder_outputs.device
 
@@ -132,7 +147,7 @@ class BeamSearch(SequenceSampler):
     - 모든 활성 빔이 EOS를 내면 즉시 종료
     - 변수 섀도잉 제거, kwargs 안정적 복사
     """
-    def __init__(self, beam_width=10, alpha=1.0):
+    def __init__(self, beam_width=12, alpha=1.0):
         self.beam_width = beam_width
         self.alpha = alpha
 
@@ -144,9 +159,15 @@ class BeamSearch(SequenceSampler):
         all_lengths = []
 
         for b in range(batch_size):
+            # [Fix] Handle LSTM tuple state (hidden, cell)
+            if isinstance(h_n, tuple):
+                h_n_sample = (h_n[0][:, b, :].unsqueeze(1).contiguous(), h_n[1][:, b, :].unsqueeze(1).contiguous())
+            else:
+                h_n_sample = h_n[:, b, :].unsqueeze(1).contiguous()
+
             seq, length = self._sample(
                 encoder_outputs[:, b, :].unsqueeze(1),
-                h_n[:, b, :].unsqueeze(1),
+                h_n_sample,
                 decoder, sos_idx, eos_idx, max_length, device
             )
             all_sequences.append(seq)
@@ -177,9 +198,16 @@ class BeamSearch(SequenceSampler):
                 output, _, kwargs = decoder(t, input_word, encoder_outputs, h_n, **beam.kwargs)
                 log_probs = F.log_softmax(output.squeeze(0), dim=0)
 
-                # 가능한 모든 토큰으로 확장
-                for tok in range(log_probs.size(0)):
-                    new_beam = beam.new_seq(tok, float(log_probs[tok].item()), eos_idx)
+                # [Optimized] Use topk instead of iterating over entire vocab
+                # Only consider top k candidates for extension (where k = beam_width * 2 for safety)
+                top_k = min(self.beam_width * 2, log_probs.size(0))
+                top_log_probs, top_indices = log_probs.topk(top_k)
+
+                for i in range(top_k):
+                    tok = top_indices[i].item()
+                    log_prob = top_log_probs[i].item()
+                    
+                    new_beam = beam.new_seq(tok, log_prob, eos_idx)
                     new_beam.kwargs = dict(kwargs) if isinstance(kwargs, dict) else kwargs
                     candidates.append(new_beam)
 
