@@ -4,12 +4,14 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from collections import Counter
 from util import Metadata
+import html
+
 
 class Vocab:
     """Simple vocabulary class"""
-    def __init__(self, tokens, specials=['<pad>', '<sos>', '<eos>', '<unk>']):
+    def __init__(self, tokens, specials=['<pad>', '<sos>', '<eos>','<unk>']):
         self.specials = specials
-        self. itos = specials + list(set(tokens) - set(specials))
+        self.itos = specials + sorted(list(set(tokens) - set(specials)))
         self.stoi = {tok: i for i, tok in enumerate(self.itos)}
         self.unk_index = self.stoi['<unk>']
         
@@ -22,16 +24,28 @@ class Vocab:
     def decode(self, indices):
         return [self.itos[idx] for idx in indices]
 
+def limit_vocab(tokens_iterator, max_size=50000):
+    """
+    Limit vocabulary to top max_size frequent words.
+    """
+    # Count all tokens
+    counter = Counter(tokens_iterator)
+    # Get top max_size tokens
+    most_common = counter.most_common(max_size)
+    # Return list of tokens
+    return [token for token, count in most_common]
+
 class LazyTranslationDataset(Dataset):
     """
     Lazy loading dataset for translation tasks.
     Indexes file offsets on initialization and reads lines on-demand.
     Minimal memory footprint suitable for multiprocessing.
     """
-    def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False):
+    def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False, max_len=50):
         self.src_file = src_file
         self.tgt_file = tgt_file
         self.reverse_src = reverse_src
+        self.max_len = max_len
         
         # 1. Build line offsets
         print(f"Indexing {src_file}...")
@@ -47,14 +61,18 @@ class LazyTranslationDataset(Dataset):
         if src_vocab is None:
             print("Building source vocabulary...")
             src_tokens = self._scan_for_vocab(src_file, reverse_src)
-            self.src_vocab = Vocab(src_tokens)
+            # Limit to top 50k
+            src_tokens_limited = limit_vocab(src_tokens, max_size=50000)
+            self.src_vocab = Vocab(src_tokens_limited)
         else:
             self.src_vocab = src_vocab
             
         if tgt_vocab is None:
             print("Building target vocabulary...")
             tgt_tokens = self._scan_for_vocab(tgt_file, False)
-            self.tgt_vocab = Vocab(tgt_tokens)
+            # Limit to top 50k
+            tgt_tokens_limited = limit_vocab(tgt_tokens, max_size=50000)
+            self.tgt_vocab = Vocab(tgt_tokens_limited)
         else:
             self.tgt_vocab = tgt_vocab
             
@@ -71,16 +89,12 @@ class LazyTranslationDataset(Dataset):
         return torch.tensor(offsets, dtype=torch.long)
     
     def _scan_for_vocab(self, path, reverse):
-        all_tokens = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 tokens = line.strip().split()
-                if reverse:
-                    # Reversing doesn't change the set of tokens, but good for consistency
-                    # Actually for vocab building order doesn't matter unless using special construction
-                    pass 
-                all_tokens.extend(tokens)
-        return all_tokens
+                # Apply HTML unescape to handle entities
+                tokens = [html.unescape(t) for t in tokens]
+                yield from tokens
 
     def _read_line(self, path, offset):
         with open(path, 'r', encoding='utf-8') as f:
@@ -95,10 +109,20 @@ class LazyTranslationDataset(Dataset):
         src_tokens = self._read_line(self.src_file, self.src_offsets[idx].item())
         if self.reverse_src:
             src_tokens = list(reversed(src_tokens))
+        
+        # Truncate
+        if len(src_tokens) > self.max_len:
+            src_tokens = src_tokens[:self.max_len]
+            
         src = src_tokens + ['<eos>']
         
         # 2. Read Target
         tgt_tokens = self._read_line(self.tgt_file, self.tgt_offsets[idx].item())
+        
+        # Truncate
+        if len(tgt_tokens) > self.max_len:
+            tgt_tokens = tgt_tokens[:self.max_len]
+            
         tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
         src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
@@ -108,14 +132,17 @@ class LazyTranslationDataset(Dataset):
 
 class TranslationDataset(Dataset):
     """Dataset for translation tasks"""
-    def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False):
+    def __init__(self, src_file, tgt_file, src_vocab=None, tgt_vocab=None, reverse_src=False, max_len=50):
         self.src_sentences = []
         self.tgt_sentences = []
+        self.max_len = max_len
         
         # Read source file
         with open(src_file, 'r', encoding='utf-8') as f:
             for line in f:
                 tokens = line.strip().split()
+                # Apply HTML unescape
+                tokens = [html.unescape(t) for t in tokens]
                 if reverse_src:
                     tokens = list(reversed(tokens))
                 self.src_sentences.append(tokens)
@@ -123,20 +150,29 @@ class TranslationDataset(Dataset):
         # Read target file
         with open(tgt_file, 'r', encoding='utf-8') as f:
             for line in f: 
-                self.tgt_sentences.append(line.strip().split())
+                tokens = line.strip().split()
+                # Apply HTML unescape
+                tokens = [html.unescape(t) for t in tokens]
+                self.tgt_sentences.append(tokens)
         
         assert len(self.src_sentences) == len(self.tgt_sentences)
         
         # Build or use provided vocabularies
+        # Build or use provided vocabularies
         if src_vocab is None:
+            # Re-read or process stored sentences for vocab
+            # Since tokens are already stored, we just flatten them
+            # Note: We should assume stored tokens are already unescaped in __init__ reading loop below
             all_tokens = [tok for sent in self.src_sentences for tok in sent]
-            self.src_vocab = Vocab(all_tokens)
+            limited_tokens = limit_vocab(all_tokens, max_size=50000)
+            self.src_vocab = Vocab(limited_tokens)
         else:
             self.src_vocab = src_vocab
             
         if tgt_vocab is None:
             all_tokens = [tok for sent in self.tgt_sentences for tok in sent]
-            self.tgt_vocab = Vocab(all_tokens)
+            limited_tokens = limit_vocab(all_tokens, max_size=50000)
+            self.tgt_vocab = Vocab(limited_tokens)
         else:
             self.tgt_vocab = tgt_vocab
     
@@ -146,25 +182,35 @@ class TranslationDataset(Dataset):
     def __getitem__(self, idx):
         # 1. Source 처리: <sos> 제거
         # Encoder는 문장을 읽기만 하면 되므로 시작 토큰 불필요
-        src = self.src_sentences[idx] + ['<eos>'] 
+        src_tokens = self.src_sentences[idx]
+        if len(src_tokens) > self.max_len:
+            src_tokens = src_tokens[:self.max_len]
+        src = src_tokens + ['<eos>'] 
         
         # 2. Target 처리: 학습용 전체 시퀀스 생성
-        tgt = ['<sos>'] + self.tgt_sentences[idx] + ['<eos>']
+        tgt_tokens = self.tgt_sentences[idx]
+        if len(tgt_tokens) > self.max_len:
+            tgt_tokens = tgt_tokens[:self.max_len]
+        tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
         src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
         tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
         
         return src_indices, tgt_indices
 
-def collate_fn(batch, pad_idx=0):
+def collate_fn(batch, pad_idx_src, pad_idx_tgt):
     """Collate function for DataLoader"""
     src_batch, tgt_batch = zip(*batch)
     
-    # Pad sequences to the same length
-    src_padded = pad_sequence(src_batch, padding_value=pad_idx, batch_first=False)
-    tgt_padded = pad_sequence(tgt_batch, padding_value=pad_idx, batch_first=False)
+    # Calculate lengths (before padding)
+    src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.long)
+    tgt_lengths = torch.tensor([len(t) for t in tgt_batch], dtype=torch.long)
     
-    return src_padded, tgt_padded
+    # Pad sequences to the same length
+    src_padded = pad_sequence(src_batch, padding_value=pad_idx_src, batch_first=False)
+    tgt_padded = pad_sequence(tgt_batch, padding_value=pad_idx_tgt, batch_first=False)
+    
+    return src_padded, tgt_padded, src_lengths, tgt_lengths
 
 def dataset_factory(args, device):
     """
@@ -195,6 +241,8 @@ def dataset_factory(args, device):
     # Determine dataset version
     if 'sample100k' in args.dataset. lower():
         root_dir = 'data/sample100k'
+    elif 'author_data' in args.dataset.lower():
+        root_dir = 'data/author_data'
     elif 'wmt15' in args.dataset.lower():
         root_dir = 'data/wmt15_vocab50k/base'
     else:
@@ -219,79 +267,109 @@ def dataset_factory(args, device):
         print("Source sentence reversal:  ENABLED (dynamic)")
     
     # Load training data first to build vocabulary
-    # Load training data first to build vocabulary
     # Use LazyTranslationDataset for WMT datasets to save memory
     DatasetClass = LazyTranslationDataset if 'wmt' in args.dataset.lower() else TranslationDataset
     
+    max_len = getattr(args, 'max_seq_len', 50)
+    print(f"Max sequence length: {max_len}")
+
+    
+    # Determine filenames based on dataset type
+    if 'author_data' in args.dataset.lower():
+        train_src_name = f'train.10k.{src_ext}'
+        train_tgt_name = f'train.10k.{tgt_ext}'
+        val_src_name = f'valid.100.{src_ext}'
+        val_tgt_name = f'valid.100.{tgt_ext}'
+        test_src_name = f'test.100.{src_ext}'
+        test_tgt_name = f'test.100.{tgt_ext}'
+    else:
+        train_src_name = f'train.{src_ext}'
+        train_tgt_name = f'train.{tgt_ext}'
+        val_src_name = f'valid.{src_ext}'
+        val_tgt_name = f'valid.{tgt_ext}'
+        test_src_name = f'test.{src_ext}'
+        test_tgt_name = f'test.{tgt_ext}'
+
     train_dataset = DatasetClass(
-        os.path.join(data_dir, f'train.{src_ext}'),
-        os.path.join(data_dir, f'train.{tgt_ext}'),
-        reverse_src=reverse_src
+        os.path.join(data_dir, train_src_name),
+        os.path.join(data_dir, train_tgt_name),
+        reverse_src=reverse_src,
+        max_len=max_len
     )
     
     # Use training vocab for validation and test
     val_dataset = DatasetClass(
-        os.path.join(data_dir, f'valid.{src_ext}'),
-        os.path.join(data_dir, f'valid.{tgt_ext}'),
+        os.path.join(data_dir, val_src_name),
+        os.path.join(data_dir, val_tgt_name),
         src_vocab=train_dataset.src_vocab,
         tgt_vocab=train_dataset.tgt_vocab,
-        reverse_src=reverse_src
+        reverse_src=reverse_src,
+        max_len=max_len
     )
     
     test_dataset = DatasetClass(
-        os.path.join(data_dir, f'test.{src_ext}'),
-        os.path.join(data_dir, f'test.{tgt_ext}'),
+        os.path.join(data_dir, test_src_name),
+        os.path.join(data_dir, test_tgt_name),
         src_vocab=train_dataset.src_vocab,
         tgt_vocab=train_dataset.tgt_vocab,
-        reverse_src=reverse_src
+        reverse_src=reverse_src,
+        max_len=max_len
     )
     
     print(f"Vocab size: SRC={len(train_dataset.src_vocab)}, TGT={len(train_dataset.tgt_vocab)}")
     
     # Create DataLoaders
     # Note: assume shared specials so pad_idx is 0 for both; use TGT pad_idx for loss
-    pad_idx_tgt = train_dataset.tgt_vocab.stoi['<pad>']
-    
+    pad_idx_src = train_dataset.src_vocab.stoi.get('<pad>', 0)
+    pad_idx_tgt = train_dataset.tgt_vocab.stoi.get('<pad>', 0)
     train_iter = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=lambda b:  collate_fn(b, pad_idx_tgt)
+        shuffle=True,  # [Correction] Training data must be shuffled
+        collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
+        num_workers=getattr(args, 'num_workers', 0),
+        pin_memory=True if torch.cuda.is_available() else False
     )
     
     val_iter = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda b: collate_fn(b, pad_idx_tgt)
+        collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
+        num_workers=getattr(args, 'num_workers', 0),
+        pin_memory=True if torch.cuda.is_available() else False
     )
     
     test_iter = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda b: collate_fn(b, pad_idx_tgt)
+        collate_fn=lambda b: collate_fn(b, pad_idx_src, pad_idx_tgt),
+        num_workers=getattr(args, 'num_workers', 0),
+        pin_memory=True if torch.cuda.is_available() else False
     )
     
     # Build SRC/TGT metadata separately
     # Note: Both vocabs have '<pad>' at index 0 by construction in Vocab class
-    pad_idx_src = train_dataset.src_vocab.stoi.get('<pad>', 0)
-    pad_idx_tgt = train_dataset.tgt_vocab.stoi.get('<pad>', 0)
-    assert pad_idx_src == 0 and pad_idx_tgt == 0, "Padding token must be at index 0"
+
+    print('pad_idx_tgt', pad_idx_tgt)
+    #assert pad_idx_src == 0 and pad_idx_tgt == 0, "Padding token must be at index 0"
     
-    src_metadata = Metadata(vocab_size=len(train_dataset.src_vocab), padding_idx=pad_idx_src, vectors=None)
-    tgt_metadata = Metadata(vocab_size=len(train_dataset.tgt_vocab), padding_idx=pad_idx_tgt, vectors=None)
+    src_metadata = Metadata(vocab_size=len(train_dataset.src_vocab), padding_idx=pad_idx_tgt,src_padding_idx=pad_idx_src , vectors=None)
+    tgt_metadata = Metadata(vocab_size=len(train_dataset.tgt_vocab), padding_idx=pad_idx_tgt,src_padding_idx=pad_idx_src, vectors=None)
     
     # Return both vocabularies and iterators
     return src_metadata, tgt_metadata, train_dataset.src_vocab, train_dataset.tgt_vocab, BatchWrapper(train_iter, device), BatchWrapper(val_iter, device), BatchWrapper(test_iter, device)
 
 class Batch:
     """Wrapper for batch data"""
-    def __init__(self, src, trg, device):
-        self.src = src. to(device) if device else src
+    def __init__(self, src, trg, src_lengths,tgt_lengths, device):
+        self.src = src.to(device) if device else src
         self.trg = trg.to(device) if device else trg
+        self.src_lengths = src_lengths.to(device) if device else src_lengths
+        self.tgt_lengths = tgt_lengths.to(device) if device else tgt_lengths
         self.question = self.src
-        self. answer = self.trg
+        self.answer = self.trg
 
 class BatchWrapper:
     def __init__(self, dataloader, device=None):
@@ -299,8 +377,8 @@ class BatchWrapper:
         self.device = device
         
     def __iter__(self):
-        for src, trg in self.dataloader:
-            yield Batch(src, trg, self.device)
+        for src, trg, src_lengths,tgt_lengths in self.dataloader:
+            yield Batch(src, trg, src_lengths,tgt_lengths, self.device)
     
     def __len__(self):
         return len(self.dataloader)
@@ -311,5 +389,6 @@ def field_factory(args):
     return None
 
 def metadata_factory(args, vocab):
-    pad_idx = vocab.stoi. get('<pad>', 0)
-    return Metadata(vocab_size=len(vocab), padding_idx=pad_idx, vectors=None)
+    src_pad_idx=vocab.stoi.get('<pad>', 0)
+    pad_idx = vocab.stoi.get('<pad>', 0)
+    return Metadata(vocab_size=len(vocab), padding_idx=pad_idx, src_padding_idx=src_pad_idx, vectors=None)
