@@ -807,7 +807,8 @@ def main():
             if hasattr(train_iter, 'batch_sampler') and train_iter.batch_sampler is not None:
                 if hasattr(train_iter.batch_sampler, 'set_epoch'):
                     train_iter.batch_sampler.set_epoch(epoch)
-                    print(f"Batch sampler epoch set to {epoch}")
+                    if args.debug:
+                        print(f"Batch sampler epoch set to {epoch}")
             
             # [Paper] LR Scheduling: Halve after specified epoch
             if epoch > args.lr_decay_start:
