@@ -97,11 +97,10 @@ class BucketBatchSampler(Sampler):
         self.epoch = 0
         
         # Sort indices by length (short to long)
-        if isinstance(dataset_lengths, torch.Tensor):
-            sorted_indices = torch.argsort(dataset_lengths).tolist()
-        else:
-            sorted_indices = sorted(range(len(dataset_lengths)), 
-                                  key=lambda i: dataset_lengths[i])
+        # Convert to tensor for efficient sorting if needed
+        if not isinstance(dataset_lengths, torch.Tensor):
+            dataset_lengths = torch.tensor(dataset_lengths)
+        sorted_indices = torch.argsort(dataset_lengths).tolist()
         
         # Form batches from sorted indices
         self.batches = []
