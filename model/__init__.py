@@ -14,7 +14,15 @@ def train_model_factory(args, src_metadata, tgt_metadata):
     # Separate embeddings per module to match vocabularies
     encoder = encoder_factory(args, src_metadata, embed=None)
     decoder = decoder_factory(args, tgt_metadata, embed=None)
-    return Seq2SeqTrain(encoder, decoder, tgt_metadata.vocab_size, teacher_forcing_ratio=args.teacher_forcing_ratio)
+    
+    # Pass tgt_pad_idx from metadata (NOT hardcoded)
+    return Seq2SeqTrain(
+        encoder, 
+        decoder, 
+        tgt_metadata.vocab_size, 
+        teacher_forcing_ratio=args.teacher_forcing_ratio,
+        tgt_pad_idx=tgt_metadata.padding_idx
+    )
 
 
 def predict_model_factory(args, src_metadata, tgt_metadata, model_path, src_field, tgt_field):
