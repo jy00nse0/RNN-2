@@ -6,65 +6,128 @@ from constants import SOS_TOKEN, EOS_TOKEN
 from .sampling import GreedySampler, RandomSampler, BeamSearch
 # [New] util에서 init_weights 임포트
 from util import init_weights 
+from debug_utils import debug_tensor 
 
 class Seq2SeqTrain(nn.Module):
-    def __init__(self, encoder, decoder, vocab_size, teacher_forcing_ratio=0.5):
+    def __init__(self, encoder, decoder, vocab_size, teacher_forcing_ratio=0.5, tgt_pad_idx=0):
         """
-        [Docstring 유지]
+        Args:
+            encoder: Encoder module
+            decoder: Decoder module
+            vocab_size: Target vocabulary size
+            teacher_forcing_ratio: Ratio for teacher forcing (0-1)
+            tgt_pad_idx: Target padding index (should be from metadata.padding_idx)
         """
         super(Seq2SeqTrain, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.vocab_size = vocab_size
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.tgt_pad_idx = tgt_pad_idx  # Store padding index from metadata
         
         # [New] 논문 재현을 위한 파라미터 초기화 (Uniform -0.1 ~ 0.1)
         # Encoder, Decoder를 포함한 전체 서브모듈에 적용
         self.apply(init_weights)
 
-    def forward(self, question, answer):
+    def forward(self, question, answer, src_lengths=None):
         # [기존 코드 유지]
         answer_seq_len = answer.size(0)
         batch_size = answer.size(1)
         
-        encoder_outputs, h_n = self.encoder(question)
+        encoder_outputs, h_n = self.encoder(question, src_lengths)
         
         # Explicit slicing for decoder input and labels
         # answer: (tgt_len, batch)
         decoder_input = answer[:-1]   # (tgt_len-1, batch)  <sos> ... 마지막 단어
+        # target label for teacher forcing
         target_label = answer[1:]     # (tgt_len-1, batch)  첫 단어 ... <eos>
-        
-        # Pre-allocate output tensor to avoid repeated concatenation
-        # Shape: (seq_len-1, batch_size, vocab_size)
-        # Use encoder_outputs dtype to match model precision (supports mixed precision)
-        #outputs = torch.empty(answer_seq_len - 1, batch_size, self.vocab_size,
-        #                    dtype=encoder_outputs.dtype, device=answer.device)
-        outputs = torch.empty(
-            decoder_input.size(0), batch_size, self.vocab_size,
-            dtype=encoder_outputs.dtype, device=answer.device
-        )
         
         # Handle edge case: if decoder_input is empty (answer only contains <sos>)
         if decoder_input.size(0) == 0:
-            return outputs
+            # Return an empty logits tensor with correct shape/device/dtype
+            batch_size = answer.size(1)
+            return torch.empty(
+                0, batch_size, self.vocab_size,
+                dtype=encoder_outputs.dtype, device=answer.device
+            )
+        
+        # ===== [NEW] Calculate valid target lengths and timestep mask (exclude padding) =====
+        # Count non-pad tokens in decoder_input for each sample in batch
+        # decoder_input: (tgt_len-1, batch)
+        # Use stored tgt_pad_idx from metadata (set in __init__)
+        tgt_lengths = (decoder_input != self.tgt_pad_idx).sum(dim=0)  # (batch,)
+        max_valid_len = int(tgt_lengths.max().item())
+        
+        # Safety: ensure we don't exceed actual tensor size
+        max_valid_len = min(max_valid_len, decoder_input.size(0))
+        
+        # [Solution 2] Create timestep mask: (max_valid_len, batch)
+        # True if sample is active at timestep t
+        timestep_mask = torch.arange(max_valid_len, device=decoder_input.device).unsqueeze(1) < tgt_lengths.unsqueeze(0)
         
         kwargs = {}
         input_word = decoder_input[0]
-        #for t in range(answer_seq_len - 1):
-        for t in range(decoder_input.size(0)):
-            output, attn_weights, kwargs = self.decoder(t, input_word, encoder_outputs, h_n, **kwargs)
+        
+        # Create encoder mask (batch, seq_len)
+        # src_lengths: (batch)
+        max_src_len = question.size(0)
+        encoder_mask = torch.arange(max_src_len, device=question.device).expand(batch_size, max_src_len) < src_lengths.unsqueeze(1)
+        
+        # [DEBUG] Mask
+        debug_tensor("Encoder Mask", encoder_mask, context="Seq2SeqTrain.forward", values=True)
+        logits_steps = []
+        
+        # ===== [MODIFIED] Loop with Solution 2: Selective Masking =====
+        for t in range(max_valid_len):
+            active_mask = timestep_mask[t]  # (batch,)
             
-            # Fill pre-allocated tensor in-place (no concatenation needed)
-            outputs[t] = output
+            # Forward pass: process all samples
+            output, attn_weights, next_kwargs = self.decoder(t, input_word, encoder_outputs, h_n, encoder_mask=encoder_mask, **kwargs)
+            
+            # If some samples are inactive, mask outputs and restore hidden states
+            if not active_mask.all():
+                # 1. Mask inactive outputs with -1e9 (cross-entropy will ignore them)
+                output = output.masked_fill(~active_mask.unsqueeze(1), -1e2)
+                
+                # 2. Restore previous states for inactive samples (avoid padding pollution)
+                # t=0 case: kwargs is empty, but decoder already initialized states in kwargs_init
+                # However, for t > 0, we can restore from previous iteration's kwargs
+                if kwargs:  # For t > 0
+                    for key in next_kwargs:
+                        val = next_kwargs[key]
+                        prev_val = kwargs[key]
+                        
+                        if isinstance(val, torch.Tensor):
+                            if val.dim() == 2:  # e.g., Luong attn hidden (batch, dim)
+                                next_kwargs[key] = torch.where(active_mask.unsqueeze(-1), val, prev_val)
+                            elif val.dim() == 3:  # e.g., GRU state (layers, batch, dim)
+                                next_kwargs[key] = torch.where(active_mask.view(1, -1, 1), val, prev_val)
+                        elif isinstance(val, tuple):  # e.g., LSTM state (h, c)
+                            h, c = val
+                            ph, pc = prev_val
+                            # h, c: (layers, batch, dim)
+                            new_h = torch.where(active_mask.view(1, -1, 1), h, ph)
+                            new_c = torch.where(active_mask.view(1, -1, 1), c, pc)
+                            next_kwargs[key] = (new_h, new_c)
+            
+            kwargs = next_kwargs
+            logits_steps.append(output)
 
             teacher_forcing = random.random() < self.teacher_forcing_ratio
             if teacher_forcing:
-                #input_word = answer[t + 1]  
-                input_word = target_label[t]
+                # Ensure we don't go out of bounds
+                if t < target_label.size(0):
+                    input_word = target_label[t]
+                # else: keep previous input_word (fallback for safety)
             else:
-                _, argmax = output.max(dim=1)
-                input_word = argmax  
+                input_word = output.argmax(dim=1)
+        
+        outputs = torch.stack(logits_steps, dim=0)  # (max_valid_len, batch, vocab_size)
 
+                
+        # [DEBUG] Final Output
+        debug_tensor("Final Alloc Output", outputs, context="Seq2SeqTrain.forward", values=False)
+        print("Final Output shape", outputs.shape)
         return outputs
 
 class Seq2SeqPredict(nn.Module):
@@ -115,16 +178,39 @@ class Seq2SeqPredict(nn.Module):
         return seq.strip()
 
     def forward(self, questions, sampling_strategy, max_seq_len):
-        # raw strings to tensor using source field
-        q = self.src_field.process([self.src_field.preprocess(question) for question in questions])
+        if isinstance(questions, torch.Tensor):
+            q = questions
+            # Recalculate lengths if not provided?
+            # Ideally lengths should be passed if we pass tensor.
+            # But the signature only takes 'questions'.
+            # We can deduce lengths from padding.
+            pad_idx = self.src_field.vocab.stoi.get('<eos>', 0)
+            lengths = (q != pad_idx).sum(dim=0)
+            lengths = lengths.to('cpu')
+        else:
+            # raw strings to tensor using source field
+            q = self.src_field.process([self.src_field.preprocess(question) for question in questions])
+            lengths = (q != self.src_field.vocab.stoi.get('<eos>', 0)).sum(dim=0).to('cpu')
         
         # Move tensor to the same device as the model
         device = next(self.encoder.parameters()).device
         q = q.to(device)
 
         # encode question sequence
-        encoder_outputs, h_n = self.encoder(q)
-
+        encoder_outputs, h_n = self.encoder(q, lengths)
+        #print(self.encoder.embed)
+                # [DEBUG] Print 10th token embedding
+        '''
+        if hasattr(self.encoder.embed, 'weight'):
+            print(f"Embedding for token 10: {self.encoder.embed.weight[10]}")
+        else:
+             # If embed is not a standard Embedding layer (e.g. customized), try forward pass
+             with torch.no_grad():
+                 dummy_idx = torch.LongTensor([10])
+                 if next(self.encoder.embed.parameters()).is_cuda:
+                     dummy_idx = dummy_idx.cuda()
+                 print(f"Embedding for token 10: {self.encoder.embed(dummy_idx)}")
+        '''
         # sample output sequence
         sequences, lengths = self.samplers[sampling_strategy].sample(encoder_outputs, h_n, self.decoder, self.sos_idx,
                                                                      self.eos_idx, max_seq_len)
