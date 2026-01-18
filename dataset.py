@@ -86,7 +86,7 @@ class LazyTranslationDataset(Dataset):
                 offsets.append(f.tell())
         # Remove last offset which points to EOF
         offsets.pop() 
-        return torch.tensor(offsets, dtype=torch.long)
+        return torch.tensor(offsets, dtype=torch.int)
     
     def _scan_for_vocab(self, path, reverse):
         with open(path, 'r', encoding='utf-8') as f:
@@ -125,8 +125,8 @@ class LazyTranslationDataset(Dataset):
             
         tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
-        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
-        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
+        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.int)
+        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.int)
         
         return src_indices, tgt_indices
 
@@ -193,25 +193,55 @@ class TranslationDataset(Dataset):
             tgt_tokens = tgt_tokens[:self.max_len]
         tgt = ['<sos>'] + tgt_tokens + ['<eos>']
         
-        src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.long)
-        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.long)
-        
+        #src_indices = torch.tensor(self.src_vocab.encode(src), dtype=torch.int)
+        #tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt), dtype=torch.int)
+                
+        src_indices = torch.tensor(self.src_vocab.encode(src))
+        tgt_indices = torch.tensor(self.tgt_vocab.encode(tgt))
         return src_indices, tgt_indices
+import torch
 
-def collate_fn(batch, pad_idx_src, pad_idx_tgt):
-    """Collate function for DataLoader"""
+def left_pad_sequence(seqs, padding_value, batch_first=False):
+    """
+    seqs: list[Tensor] where each Tensor is shape (len,)
+    returns: Tensor shape (max_len, batch) if batch_first=False else (batch, max_len)
+    """
+    assert len(seqs) > 0
+    lengths = torch.tensor([s.size(0) for s in seqs], dtype=torch.int64)
+    max_len = int(lengths.max().item())
+
+    # dtype/device는 첫 샘플 기준(일반적으로 CPU long)
+    out = seqs[0].new_full((len(seqs), max_len), fill_value=padding_value)  # (batch, max_len)
+
+    for i, s in enumerate(seqs):
+        l = s.size(0)
+        out[i, max_len - l:] = s  # 오른쪽에 실제 토큰을 붙임 => 왼쪽이 pad
+
+    if batch_first:
+        return out, lengths
+    else:
+        return out.t().contiguous(), lengths  # (max_len, batch)
+from torch.nn.utils.rnn import pad_sequence
+
+def collate_fn(batch, pad_idx_src, pad_idx_tgt, left_pad_src=True, left_pad_tgt=False):
     src_batch, tgt_batch = zip(*batch)
-    
-    # Calculate lengths (before padding)
-    src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.long)
-    tgt_lengths = torch.tensor([len(t) for t in tgt_batch], dtype=torch.long)
-    
-    # Pad sequences to the same length
-    src_padded = pad_sequence(src_batch, padding_value=pad_idx_src, batch_first=False)
-    tgt_padded = pad_sequence(tgt_batch, padding_value=pad_idx_tgt, batch_first=False)
-    
-    return src_padded, tgt_padded, src_lengths, tgt_lengths
 
+    # lengths (패딩 전)
+    src_lengths = torch.tensor([len(s) for s in src_batch], dtype=torch.int64)
+    tgt_lengths = torch.tensor([len(t) for t in tgt_batch], dtype=torch.int64)
+
+    # pad
+    if left_pad_src:
+        src_padded, _ = left_pad_sequence(list(src_batch), padding_value=pad_idx_src, batch_first=False)
+    else:
+        src_padded = pad_sequence(src_batch, padding_value=pad_idx_src, batch_first=False)
+
+    if left_pad_tgt:
+        tgt_padded, _ = left_pad_sequence(list(tgt_batch), padding_value=pad_idx_tgt, batch_first=False)
+    else:
+        tgt_padded = pad_sequence(tgt_batch, padding_value=pad_idx_tgt, batch_first=False)
+
+    return src_padded, tgt_padded, src_lengths, tgt_lengths
 def dataset_factory(args, device):
     """
     WMT14/15 데이터셋 로더
@@ -325,7 +355,7 @@ def dataset_factory(args, device):
     train_iter = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,  # [Correction] Training data must be shuffled
+        shuffle=False,  # [Correction] Training data must be shuffled
         collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
         num_workers=getattr(args, 'num_workers', 0),
         pin_memory=True if torch.cuda.is_available() else False
