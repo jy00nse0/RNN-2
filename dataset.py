@@ -463,7 +463,7 @@ def dataset_factory(args, device):
     print(f"Loading data for {args.dataset}...")
 
     # Determine dataset version
-    if 'sample100k' in args.dataset. lower():
+    if 'sample100k' in args.dataset.lower():
         root_dir = 'data/sample100k'
     elif 'author_data' in args.dataset.lower():
         root_dir = 'data/author_data'
