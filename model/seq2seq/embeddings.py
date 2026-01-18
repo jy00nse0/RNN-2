@@ -14,7 +14,7 @@ def embeddings_factory(args, metadata):
         embed = nn.Embedding(
             num_embeddings=metadata.vocab_size,
             embedding_dim=args.embedding_size,
-            padding_idx=None
+            padding_idx=metadata.padding_idx
         )
         with torch.no_grad():
             nn.init.uniform_(embed.weight, -0.1, 0.1)
@@ -25,4 +25,5 @@ def embeddings_factory(args, metadata):
 
     embed.weight.requires_grad = args.train_embeddings
     return embed
+
 
