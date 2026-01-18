@@ -466,7 +466,7 @@ def main():
             print(f"Training already completed ({completed_epochs}/{max_epochs} epochs). Skipping.")
         else:
             # 3. 학습 명령 구성
-            cmd = f"python train.py --dataset {config['dataset']} --save-path {save_path}" + common_flags + " --num-workers 0"
+            cmd = f"python train.py --dataset {config['dataset']} --save-path {save_path}" + common_flags + " --num-workers 12 --max-seq-len 50"
             
             # Resume 플래그 추가
             if checkpoint_path:  
