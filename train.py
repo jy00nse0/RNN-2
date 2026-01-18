@@ -2,6 +2,11 @@
 
 import os
 os.environ['PYTHONHASHSEED'] = '0'
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:2"
+
+import torch
+
 import argparse
 import torch
 import torch.nn as nn
@@ -304,14 +309,14 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
     device = src_seq_1.device
 
     # Start with <sos>
-    tgt_seq = torch.tensor([[sos_idx]], dtype=torch.long, device=device)  # (1, 1)
+    tgt_seq = torch.tensor([[sos_idx]], dtype=torch.int, device=device)  # (1, 1)
 
     # Iteratively decode next tokens
     for _ in range(max_len):
         # Forward pass with the current partial target (teacher forcing disabled)
         # Seq2SeqTrain.forward slices input[:-1], so we append a dummy token
         # to ensure the last token in tgt_seq is used as input
-        dummy_token = torch.zeros(1, 1, dtype=torch.long, device=device)
+        dummy_token = torch.zeros(1, 1, dtype=torch.int, device=device)
         model_input = torch.cat([tgt_seq, dummy_token], dim=0)
         
         logits = model(src_seq_1, model_input, src_lengths=src_length)            # (tgt_len-1, 1, vocab)
@@ -323,7 +328,7 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
             break
 
         # Append the predicted token and continue
-        next_tok_tensor = torch.tensor([[next_token]], dtype=torch.long, device=device)
+        next_tok_tensor = torch.tensor([[next_token]], dtype=torch.int, device=device)
         tgt_seq = torch.cat([tgt_seq, next_tok_tensor], dim=0)
 
     # Return generated tokens (excluding <sos>)
