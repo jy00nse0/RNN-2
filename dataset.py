@@ -588,6 +588,8 @@ def dataset_factory(args, device):
             seed=bucket_seed
         )
         
+        # Note: When using batch_sampler, batch_size and shuffle parameters
+        # are not specified in DataLoader (they are mutually exclusive)
         train_iter = DataLoader(
             train_dataset,  # Use original dataset for actual data loading
             batch_sampler=train_batch_sampler,
@@ -596,10 +598,12 @@ def dataset_factory(args, device):
             pin_memory=True if torch.cuda.is_available() else False
         )
     else:
+        # Note: shuffle=False maintains original behavior for backward compatibility
+        # For better training performance, consider enabling bucketing with --use-bucketing
         train_iter = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=False,  # No shuffle when bucketing is disabled (maintains original behavior)
+            shuffle=False,
             collate_fn=lambda b:  collate_fn(b, pad_idx_src, pad_idx_tgt),
             num_workers=getattr(args, 'num_workers', 0),
             pin_memory=True if torch.cuda.is_available() else False
