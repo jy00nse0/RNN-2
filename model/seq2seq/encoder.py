@@ -127,9 +127,10 @@ class SimpleEncoder(Encoder):
         embedded = self.embed(input)
         
         if input_lengths is not None:
+            print("Use pack_padded_sequence")
             # [Fix] Use pack_padded_sequence to ignore padding
             # enforce_sorted=False allows unsorted batch (standard in current DataLoader)
-            '''
+            
             # pack_padded_sequence will sort internally
             packed_embedded = pack_padded_sequence(embedded, input_lengths.cpu(), enforce_sorted=False)
             
@@ -147,8 +148,8 @@ class SimpleEncoder(Encoder):
                             h_n[1].index_select(1, unsorted_indices))
                  else: # GRU returns h_n tensor
                      h_n = h_n.index_select(1, unsorted_indices)
-            '''
-            outputs, h_n = self.rnn(embedded, h_0)
+            
+            #outputs, h_n = self.rnn(embedded, h_0)
         else:
             # [Optimized] Call cuDNN fused RNN once
             outputs, h_n = self.rnn(embedded, h_0)
