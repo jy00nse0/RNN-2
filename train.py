@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+os.environ['PYTHONHASHSEED'] = '0'
 import argparse
 import torch
 import torch.nn as nn
@@ -12,11 +13,13 @@ from dataset import dataset_factory
 from model import train_model_factory
 from serialization import save_object, save_model, save_vocab
 from datetime import datetime
-from util import embedding_size_from_name, load_training_metrics, plot_loss_graph
+from util import embedding_size_from_name, load_training_metrics, plot_loss_graph, count_nonzero_grad_vocab, summarize_delta
 from tqdm import tqdm
 import numpy as np
 from collections import defaultdict
 import json
+import debug_utils
+from debug_utils import set_debug_mode, debug_tensor, debug_print
 
 """
 [Optimized] train.py for RNN Paper Reproduction
@@ -67,15 +70,17 @@ def parse_args():
     parser.add_argument('--embedding-type', type=str, default=None)
     parser.add_argument('--save-path', default='.save',
                        help='Folder where models (and other configs) will be saved during training.')
-    parser.add_argument('--save-every-epoch', action='store_true',default=True,
+    parser.add_argument('--save-every-epoch', action='store_true',default=False,
                        help='Save model every epoch regardless of validation loss.')
     parser.add_argument('--dataset', 
                        choices=['twitter-applesupport', 'twitter-amazonhelp', 'twitter-delta',
                                'twitter-spotifycares', 'twitter-uber_support', 'twitter-all',
-                               'twitter-small', 'wmt14-en-de', 'wmt15-deen', 'sample100k'],
+                               'twitter-small', 'wmt14-en-de', 'wmt15-deen', 'sample100k', 'author_data'],
                        help='Dataset for training model.')
     parser.add_argument('--teacher-forcing-ratio', type=float, default=1.0,
                        help='Teacher forcing ratio used in seq2seq models. [0-1]')
+    parser.add_argument('--teacher-forcing-decay', action='store_true', default=False,
+                       help='Enable linear decay of teacher forcing ratio (1.0 -> 0.0).')
     
     # [Paper] Experimental Setup
     parser.add_argument('--reverse', action='store_true', 
@@ -101,7 +106,7 @@ def parse_args():
                            help='Enable per-batch logging and verbose evaluation.')
     debug_args.add_argument('--log-interval', type=int, default=100,
                            help='Batch interval for logging when --debug is set.')
-    debug_args.add_argument('--sample-translations', action='store_true', default=False,
+    debug_args.add_argument('--sample-translations', action='store_true', default=True,
                            help='Print sample translations after each epoch.')
     debug_args.add_argument('--print-model-summary', action='store_true', default=False,
                            help='Print model architecture and parameter counts.')
@@ -277,8 +282,10 @@ def _get_special_token_indices(tgt_metadata, tgt_vocab):
     # Fallbacks if metadata does not expose indices
     if sos_idx is None:
         sos_idx = tgt_vocab.stoi.get('<sos>', tgt_vocab.stoi.get('<go>', 1))
+        print('sos_idx', sos_idx)
     if eos_idx is None:
         eos_idx = tgt_vocab.stoi.get('<eos>', tgt_vocab.stoi.get('<end>', 2))
+        print('eos_idx', eos_idx)
     return sos_idx, eos_idx
 
 
@@ -302,8 +309,12 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
     # Iteratively decode next tokens
     for _ in range(max_len):
         # Forward pass with the current partial target (teacher forcing disabled)
-        # Pass src_lengths if provided
-        logits = model(src_seq_1, tgt_seq, src_lengths=src_length)            # (tgt_len-1, 1, vocab)
+        # Seq2SeqTrain.forward slices input[:-1], so we append a dummy token
+        # to ensure the last token in tgt_seq is used as input
+        dummy_token = torch.zeros(1, 1, dtype=torch.long, device=device)
+        model_input = torch.cat([tgt_seq, dummy_token], dim=0)
+        
+        logits = model(src_seq_1, model_input, src_lengths=src_length)            # (tgt_len-1, 1, vocab)
         step_logit = logits[-1, 0]                    # last step for next token
         next_token = int(step_logit.argmax(dim=-1).item())
 
@@ -319,7 +330,7 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
     return tgt_seq.squeeze(1).tolist()[1:]
 
 
-def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_vocab, num_samples=3, max_len=50):
+def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_vocab, num_samples=10, max_len=50):
     """
     Generate sample translations to visualize model progress using greedy decoding with early stopping.
     - Uses model's forward iteratively to produce tokens until <eos> or max_len.
@@ -332,11 +343,13 @@ def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_v
     sos_idx, eos_idx = _get_special_token_indices(tgt_metadata, tgt_vocab)
     src_pad_idx = 0  # Source padding index (from Vocab construction)
     tgt_pad_idx = tgt_metadata.padding_idx
+    
+    count = 0
 
     with torch.no_grad():
         # Create a fresh iterator to avoid state conflicts
-        for i, batch in enumerate(iter(val_iter)):
-            if i >= num_samples:
+        for batch in iter(val_iter):
+            if count >= num_samples:
                 break
             
             question, answer = batch.question, batch.answer
@@ -344,43 +357,51 @@ def generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_v
             # Check if batch has data
             if question.size(1) == 0 or answer.size(0) == 0:
                 continue
-
-            # Decode only the first item in the batch
-            src_seq_1 = question[:, 0:1].to(device)  # keep batch dimension = 1
             
-            # Handle potential empty sequence if filtering removed everything
-            if src_seq_1.size(0) == 0:
-                continue
+            batch_size = question.size(1)
 
-            # Prepare lengths for greedy decode (shape (1,))
-            src_length = batch.src_lengths[0:1] # Keep it as tensor (1,)
+            # Iterate through each sample in the batch
+            for b_idx in range(batch_size):
+                if count >= num_samples:
+                    break
 
-            pred_token_ids = _greedy_decode_sequence(
-                model=model,
-                src_seq_1=src_seq_1,
-                sos_idx=sos_idx,
-                eos_idx=eos_idx,
-                max_len=max_len,
-                src_length=src_length
-            )
+                # Decode the current item in the batch
+                src_seq_1 = question[:, b_idx:b_idx+1].to(device)  # keep batch dimension = 1
+                
+                # Handle potential empty sequence if filtering removed everything
+                if src_seq_1.size(0) == 0:
+                    continue
 
-            # Prepare tokens for display
-            src_tokens = question[:, 0].cpu().tolist()
-            tgt_tokens = answer[1:, 0].cpu().tolist()  # ground truth without <sos>
+                # Prepare lengths for greedy decode (shape (1,))
+                src_length = batch.src_lengths[b_idx:b_idx+1] # Keep it as tensor (1,)
 
-            # Convert to words (filter padding and invalid indices)
-            src_words = [src_vocab.itos[idx] for idx in src_tokens
-                         if 0 <= idx < len(src_vocab.itos) and idx != src_pad_idx]
-            tgt_words = [tgt_vocab.itos[idx] for idx in tgt_tokens
-                         if 0 <= idx < len(tgt_vocab.itos) and idx != tgt_pad_idx]
-            pred_words = [tgt_vocab.itos[idx] for idx in pred_token_ids
-                          if 0 <= idx < len(tgt_vocab.itos) and idx != tgt_pad_idx]
-            
-            samples.append({
-                'source': ' '.join(src_words),
-                'target': ' '.join(tgt_words),
-                'prediction': ' '.join(pred_words)
-            })
+                pred_token_ids = _greedy_decode_sequence(
+                    model=model,
+                    src_seq_1=src_seq_1,
+                    sos_idx=sos_idx,
+                    eos_idx=eos_idx,
+                    max_len=max_len,
+                    src_length=src_length
+                )
+
+                # Prepare tokens for display
+                src_tokens = question[:, b_idx].cpu().tolist()
+                tgt_tokens = answer[1:, b_idx].cpu().tolist()  # ground truth without <sos>
+
+                # Convert to words (filter padding and invalid indices)
+                src_words = [src_vocab.itos[idx] for idx in src_tokens
+                             if 0 <= idx < len(src_vocab.itos) and idx != src_pad_idx]
+                tgt_words = [tgt_vocab.itos[idx] for idx in tgt_tokens
+                             if 0 <= idx < len(tgt_vocab.itos) and idx != tgt_pad_idx]
+                pred_words = [tgt_vocab.itos[idx] for idx in pred_token_ids
+                              if 0 <= idx < len(tgt_vocab.itos) and idx != tgt_pad_idx]
+                
+                samples.append({
+                    'source': ' '.join(src_words),
+                    'target': ' '.join(tgt_words),
+                    'prediction': ' '.join(pred_words)
+                })
+                count += 1
     
     return samples
 
@@ -418,12 +439,39 @@ def evaluate(model, val_iter, metadata, reverse_src=False, verbose=False, collec
             #     question = batch_reverse_source(question, metadata.padding_idx)
             
             logits = model(question, answer, batch.src_lengths)
-            
+            # ===== [MODIFIED] Handle dynamic decoder output length =====
+            #actual_output_len = logits.size(0)
+            #target_label_forloss = answer[1:actual_output_len+1].clone()
+            #target_label_forloss[target_label_forloss == metadata.padding_idx] = -100
+            # logits: (actual_output_len, batch, vocab)
+            actual_output_len = logits.size(0)
+
+            # target_label_forloss: (actual_output_len, batch)
+            target_label_forloss = answer[1:actual_output_len + 1].clone()
+
+            # tgt_sentence_length: (batch,)  eos 포함
+            # Case A) tgt_sentence_length가 <sos> 포함 전체 길이라면 => -1
+            valid_steps =  batch.tgt_lengths  - 1  # (batch,)
+
+            # 혹시 이미 <sos> 제외 길이라면 위 줄을 다음으로 바꾸세요:
+            # valid_steps = tgt_sentence_length
+
+            # 안전장치: 음수 방지 + logits 길이로 clamp
+            valid_steps = valid_steps.clamp(min=0, max=actual_output_len)
+
+            # timestep index 만들기: (actual_output_len, 1)
+            t = torch.arange(actual_output_len, device=target_label_forloss.device).unsqueeze(1)
+
+            # mask: True=유효, False=무시할 위치  (actual_output_len, batch)
+            valid_mask = t < valid_steps.unsqueeze(0)
+
+            # 유효 길이 바깥을 -100으로 치환
+            target_label_forloss = target_label_forloss.masked_fill(~valid_mask, -100)
             # [OPTIMIZED] reshape() instead of view() - safer, handles non-contiguous tensors
             loss = F.cross_entropy(
                 logits.reshape(-1, metadata.vocab_size),
-                answer[1:].reshape(-1),
-                ignore_index=metadata.padding_idx
+                target_label_forloss.reshape(-1),
+                ignore_index=-100
             )
             if collect_loss_history:
                 batch_losses.append(loss.item())
@@ -480,29 +528,46 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
         stats: Dictionary with detailed statistics
     """
     # [OPTIMIZED] Enable performance optimizations
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     
     model.train()
     total_loss = 0
     batch_losses = [] if collect_loss_history else None
     grad_norms = []
-    
+    wen = model.encoder.rnn.weight_ih_l0
+    wdn = model.decoder.rnn.weight_ih_l0
+    wen_before = wen.detach().clone()
+    wdn_before = wdn.detach().clone()
+    #print("before updating -- encoder embed :",model.encoder.embed.weight[2][:20])
+    #print("before updating -- decoder embed :",model.decoder.embed.weight[2][:20])
+    #print("before updating -- encoder rnn weight :",model.encoder.rnn.weight_ih_l0)
+    #print("before updating -- decoder rnn weight :",model.decoder.rnn.weight_ih_l0)
+    #print("before updating -- decoder Linear weight :",model.decoder.out.weight.data)
+
     # Get current learning rate
     current_lr = optimizer.param_groups[0]['lr']
     total_batches = len(train_iter)
     
+    # [DEBUG] Set debug mode based on args
+    set_debug_mode(debug)
+
     for batch_idx, batch in enumerate(tqdm(train_iter, desc="Training", leave=False)):
         question, answer = batch.question, batch.answer
-
-        # [DEBUG] Check data pairing
-        if batch_idx == 0 and src_vocab is not None and vocab is not None:
+        print("src_lengths",batch.src_lengths)
+        print("question", question)
+        print("question shape", question.shape)
+        print("answer", answer)
+        print("answer shape", answer.shape)
+        # [DEBUG] Print Natural Language Sentences for the first batch or periodically
+        if debug and batch_idx == 0:
              print("\n" + "=" * 50)
-             print("DEBUG: Checking data pairing (First Batch)")
-             # access first sample
-             src_sample = question[:, 0]  # (seq_len)
-             tgt_sample = answer[:, 0]    # (seq_len)
+             print(f"DEBUG: Processing Batch {batch_idx}")
+             # Access first sample in batch
+             # Note: question is (seq_len, batch)
+             src_sample = question[:, 0]
+             tgt_sample = answer[:, 0]
              
              src_text = []
              for token in src_sample:
@@ -520,8 +585,8 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
                       if word not in ['<pad>']:
                            tgt_text.append(word)
 
-             print(f"SRC: {' '.join(src_text)}")
-             print(f"TGT: {' '.join(tgt_text)}")
+             print(f"  Sample Source Sentence: {' '.join(src_text)}")
+             print(f"  Sample Target Sentence: {' '.join(tgt_text)}")
              print("=" * 50 + "\n")
         
         # [Feature] Reverse Source if flag is set
@@ -531,13 +596,22 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
         # [OPTIMIZED] AMP context (no-op if use_amp=False)
         with autocast(enabled=use_amp):
             logits = model(question, answer, batch.src_lengths)
-            # Shifted labels: remove <sos>
-            target_label = answer[1:]  # (tgt_len-1, batch)
+            print("logits shape : ",logits.shape)
+            
+            # ===== [MODIFIED] Handle dynamic decoder output length =====
+            # logits may be shorter than answer[1:] due to dynamic loop bounds
+            actual_output_len = logits.size(0)
+            
+            # Slice target labels to match logits length
+            target_label_forloss = answer[1:actual_output_len+1].clone()  # (actual_len, batch)
+            target_label_forloss[target_label_forloss == metadata.padding_idx] = -100
+
+            
             # [OPTIMIZED] reshape() instead of view()
             loss = F.cross_entropy(
                 logits.reshape(-1, metadata.vocab_size),
-                answer[1:].reshape(-1),
-                ignore_index=metadata.padding_idx
+                target_label_forloss.reshape(-1),
+                ignore_index=-100
             )
         
         # Check for NaN/Inf
@@ -566,7 +640,20 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.step()
+            summarize_delta(wen_before, model.encoder.rnn.weight_ih_l0, name="enc weight_ih_l0", eps=1e-12)
+            summarize_delta(wdn_before, model.decoder.rnn.weight_ih_l0, name="dec weight_ih_l0", eps=1e-12)
+            #print("after updating -- encoder embed :",model.encoder.embed.weight[2][:20])
+            #print("grad nonzero count:",count_nonzero_grad_vocab(model.encoder.embed.weight.grad))
+            #print("after updating -- decoder embed :",model.decoder.embed.weight[2][:20])
+            #print("grad nonzero count:",count_nonzero_grad_vocab(model.decoder.embed.weight.grad))
+            #print("after updating -- encoder rnn weight :",model.encoder.rnn.weight_ih_l0)
+            #print("after updating -- decoder rnn weight :",model.decoder.rnn.weight_ih_l0)
+            #print("after updating -- decoder Linear weight :",model.decoder.out.weight.data)
+            #print("after updating -- encoder rnn grad", model.encoder.rnn.weight_ih_l0.grad is None)
+            #print("after updating -- decoder rnn grad", model.decoder.rnn.weight_ih_l0.grad is None)
+            #print("after updating -- decoder Linear grad", model.decoder.out.weight.grad is None)
         
         # Track statistics
         batch_loss = loss.item()
@@ -580,7 +667,8 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
     
     avg_loss = total_loss / len(train_iter)
     avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-    
+
+
     # Build stats dictionary
     stats = {
         'avg_grad_norm': avg_grad_norm,
@@ -671,9 +759,15 @@ def main():
         print(f"Trainable parameters: {trainable_params:,}")
         print(f"Model dtype: {next(model.parameters()).dtype}")
         print("=" * 70)
-
+    print("requires_grad:",model.decoder.embed.weight.requires_grad)
+    print("grad:",model.decoder.embed.weight.grad)
     # ===== Optimizer Setup =====
     # [Paper] Optimizer: SGD with lr=1.0
+    print('model.parameters()',model.parameters())
+    for params in model.parameters():
+        print(params)
+        print('params.shape',params.shape)
+        print('params.requires_grad',params.requires_grad)
     optimizer = optim.SGD(model.parameters(), lr=args.learning_rate)
     
     print(f"\nOptimizer: SGD")
@@ -698,9 +792,10 @@ def main():
                 adjust_learning_rate(optimizer, epoch, args.lr_decay_start)
 
             # [Feature] Teacher Forcing Scheduling: Linear decay
+            # [Feature] Teacher Forcing Scheduling: Linear decay
             # Decay by 0.1 per epoch starting from epoch 1 (1.0 -> 0.9 -> 0.8 ...)
-            if epoch > 0:
-                decay_amount = 0.1
+            if args.teacher_forcing_decay and epoch > 0:
+                decay_amount = 0.05
                 # Calculate new ratio based on initial ratio from args
                 new_ratio = args.teacher_forcing_ratio - (epoch * decay_amount)
                 new_ratio = max(0.0, new_ratio)
@@ -708,6 +803,7 @@ def main():
                 print(f"Teacher forcing ratio decayed to: {model.teacher_forcing_ratio:.2f}")
             else:
                  # Ensure it starts at the arg value (or reset if needed)
+                 # If decay is disabled, it stays constant at args.teacher_forcing_ratio
                  model.teacher_forcing_ratio = args.teacher_forcing_ratio
 
 
@@ -743,7 +839,7 @@ def main():
             # Generate and display sample translations
             if args.sample_translations:
                 print("\n  🔍 Sample Translations:")
-                samples = generate_sample_translations(model, val_iter, tgt_metadata, src_vocab, tgt_vocab, num_samples=2)
+                samples = generate_sample_translations(model, train_iter, tgt_metadata, src_vocab, tgt_vocab, num_samples=10)
                 for i, sample in enumerate(samples, 1):
                     print(f"\n  Example {i}:")
                     print(f"    SRC: {sample['source']}")
@@ -779,13 +875,21 @@ def main():
                 save_training_metrics(args.save_path, epoch + 1, metrics)
 
             # Save model
-            if args.save_every_epoch or not best_val_loss or val_loss < best_val_loss:
-                if best_val_loss is None:
+            # Save model
+            if args.save_every_epoch or not best_val_loss or val_loss < best_val_loss or epoch == args.max_epochs - 1:
+                if epoch == args.max_epochs - 1:
+                     print(f"\n💾 Saving model (last epoch save, val_loss: {val_loss:.4f})")
+                elif best_val_loss is None:
                     print(f"\n💾 Saving model (initial save, val_loss: {val_loss:.4f})")
-                else:
+                elif val_loss < best_val_loss:
                     print(f"\n💾 Saving model (val_loss improved: {best_val_loss:.4f} → {val_loss:.4f})")
+                else:
+                    print(f"\n💾 Saving model (forced save, val_loss: {val_loss:.4f})")
+                
                 save_model(args.save_path, model, epoch + 1, train_loss, val_loss)
-                best_val_loss = val_loss
+                
+                if best_val_loss is None or val_loss < best_val_loss:
+                    best_val_loss = val_loss
             
             print()  # New line
             
