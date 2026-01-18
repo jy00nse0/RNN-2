@@ -49,8 +49,8 @@ def get_answers(model, dataloader, args, device):
         # Let's verify dataset.py collate_fn signature.
         # It returns (src_padded, tgt_padded).
         
-        # [Fixed] collate_fn returns 3 values: src_padded, tgt_padded, src_lengths
-        src, _, _ = batch 
+        # [Fixed again] collate_fn returns 4 values: src_padded, tgt_padded, src_lengths, tgt_lengths
+        src, _, _,_ = batch 
         src = src.to(device)
         
         # Determine batch size from the source tensor
