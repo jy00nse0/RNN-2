@@ -93,13 +93,13 @@ def parse_args():
     
     # ===== Bucketing Configuration =====
     bucketing_args = parser.add_argument_group('Bucketing', 'Length-bucketed batching settings.')
-    bucketing_args.add_argument('--use-bucketing', action='store_true', default=False,
+    bucketing_args.add_argument('--use-bucketing', action='store_true', default=True,
                                help='Enable length-bucketed batching for training (reduces padding, improves throughput).')
-    bucketing_args.add_argument('--bucket-by', type=str, choices=['src', 'tgt'], default='src',
+    bucketing_args.add_argument('--bucket-by', type=str, choices=['src', 'tgt'], default='tgt',
                                help='Which sequence to bucket by: src (source) or tgt (target). Default: src.')
     bucketing_args.add_argument('--bucket-drop-last', action='store_true', default=False,
                                help='Drop last incomplete batch when bucketing.')
-    bucketing_args.add_argument('--bucket-seed', type=int, default=42,
+    bucketing_args.add_argument('--bucket-seed', type=int, default=123,
                                help='Random seed for bucketing batch shuffle. Default: 42.')
     
     # ===== GPU Settings =====
@@ -320,14 +320,14 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
     device = src_seq_1.device
 
     # Start with <sos>
-    tgt_seq = torch.tensor([[sos_idx]], dtype=torch.int, device=device)  # (1, 1)
+    tgt_seq = torch.tensor([[sos_idx]], dtype=torch.long, device=device)  # (1, 1)
 
     # Iteratively decode next tokens
     for _ in range(max_len):
         # Forward pass with the current partial target (teacher forcing disabled)
         # Seq2SeqTrain.forward slices input[:-1], so we append a dummy token
         # to ensure the last token in tgt_seq is used as input
-        dummy_token = torch.zeros(1, 1, dtype=torch.int, device=device)
+        dummy_token = torch.zeros(1, 1, dtype=torch.long, device=device)
         model_input = torch.cat([tgt_seq, dummy_token], dim=0)
         
         logits = model(src_seq_1, model_input, src_lengths=src_length)            # (tgt_len-1, 1, vocab)
@@ -339,7 +339,7 @@ def _greedy_decode_sequence(model, src_seq_1, sos_idx, eos_idx, max_len, src_len
             break
 
         # Append the predicted token and continue
-        next_tok_tensor = torch.tensor([[next_token]], dtype=torch.int, device=device)
+        next_tok_tensor = torch.tensor([[next_token]], dtype=torch.long, device=device)
         tgt_seq = torch.cat([tgt_seq, next_tok_tensor], dim=0)
 
     # Return generated tokens (excluding <sos>)
@@ -449,46 +449,37 @@ def evaluate(model, val_iter, metadata, reverse_src=False, verbose=False, collec
     with torch.no_grad():
         for batch in tqdm(val_iter, desc="Evaluating", leave=False):
             question, answer = batch.question, batch.answer
-            
-            # [Feature] Reverse Source if flag is set
-            # if reverse_src:
-            #     question = batch_reverse_source(question, metadata.padding_idx)
-            
             logits = model(question, answer, batch.src_lengths)
+            #print("logits shape : ",logits.shape)
+            logits[..., 0] = float("-inf")   # V 차원 한 칸만
+
             # ===== [MODIFIED] Handle dynamic decoder output length =====
-            #actual_output_len = logits.size(0)
-            #target_label_forloss = answer[1:actual_output_len+1].clone()
-            #target_label_forloss[target_label_forloss == metadata.padding_idx] = -100
-            # logits: (actual_output_len, batch, vocab)
+            # logits may be shorter than answer[1:] due to dynamic loop bounds
             actual_output_len = logits.size(0)
-
-            # target_label_forloss: (actual_output_len, batch)
-            target_label_forloss = answer[1:actual_output_len + 1].clone()
-
-            # tgt_sentence_length: (batch,)  eos 포함
-            # Case A) tgt_sentence_length가 <sos> 포함 전체 길이라면 => -1
-            valid_steps =  batch.tgt_lengths  - 1  # (batch,)
-
-            # 혹시 이미 <sos> 제외 길이라면 위 줄을 다음으로 바꾸세요:
-            # valid_steps = tgt_sentence_length
-
-            # 안전장치: 음수 방지 + logits 길이로 clamp
-            valid_steps = valid_steps.clamp(min=0, max=actual_output_len)
-
-            # timestep index 만들기: (actual_output_len, 1)
-            t = torch.arange(actual_output_len, device=target_label_forloss.device).unsqueeze(1)
-
-            # mask: True=유효, False=무시할 위치  (actual_output_len, batch)
-            valid_mask = t < valid_steps.unsqueeze(0)
-
-            # 유효 길이 바깥을 -100으로 치환
-            target_label_forloss = target_label_forloss.masked_fill(~valid_mask, -100)
-            # [OPTIMIZED] reshape() instead of view() - safer, handles non-contiguous tensors
+            
+            # Slice target labels to match logits length
+            target_label_forloss = answer[1:actual_output_len+1].clone()  # (actual_len, batch)
+            target_label_forloss[target_label_forloss == metadata.padding_idx] = -100
+            '''
+            # [OPTIMIZED] reshape() instead of view()
             loss = F.cross_entropy(
                 logits.reshape(-1, metadata.vocab_size),
                 target_label_forloss.reshape(-1),
                 ignore_index=-100
             )
+            '''
+            # log_softmax는 vocab 차원으로 수행해야 함
+            log_probs = F.log_softmax(logits, dim=-1)  # (T, B, V)
+        # nll_loss input: (N, C) or (N, C, d1, ...) 형태 가능
+            # 여기서는 (T*B, V) 로 flatten
+            nll_loss = F.nll_loss(
+                log_probs.reshape(-1, metadata.vocab_size),     # (T*B, V)
+                target_label_forloss.reshape(-1),               # (T*B,)
+                ignore_index=-100
+            )
+                        # 유효 위치 마스크: target != -100
+            mask = (target_label_forloss != -100).float()  # (T,B)
+            loss = (nll_loss * mask).sum() / mask.sum().clamp_min(1.0)
             if collect_loss_history:
                 batch_losses.append(loss.item())
             total_loss += loss.item()
@@ -571,11 +562,11 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
 
     for batch_idx, batch in enumerate(tqdm(train_iter, desc="Training", leave=False)):
         question, answer = batch.question, batch.answer
-        print("src_lengths",batch.src_lengths)
-        print("question", question)
-        print("question shape", question.shape)
-        print("answer", answer)
-        print("answer shape", answer.shape)
+        #print("src_lengths",batch.src_lengths)
+        #print("question", question)
+        #print("question shape", question.shape)
+        #print("answer", answer)
+        #print("answer shape", answer.shape)
         # [DEBUG] Print Natural Language Sentences for the first batch or periodically
         if debug and batch_idx == 0:
              print("\n" + "=" * 50)
@@ -612,8 +603,8 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
         # [OPTIMIZED] AMP context (no-op if use_amp=False)
         with autocast(enabled=use_amp):
             logits = model(question, answer, batch.src_lengths)
-            print("logits shape : ",logits.shape)
-            
+            #print("logits shape : ",logits.shape)
+            logits[..., 0] = float("-inf")   # V 차원 한 칸만
             # ===== [MODIFIED] Handle dynamic decoder output length =====
             # logits may be shorter than answer[1:] due to dynamic loop bounds
             actual_output_len = logits.size(0)
@@ -621,15 +612,28 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
             # Slice target labels to match logits length
             target_label_forloss = answer[1:actual_output_len+1].clone()  # (actual_len, batch)
             target_label_forloss[target_label_forloss == metadata.padding_idx] = -100
-
-            
+            '''
             # [OPTIMIZED] reshape() instead of view()
             loss = F.cross_entropy(
                 logits.reshape(-1, metadata.vocab_size),
                 target_label_forloss.reshape(-1),
                 ignore_index=-100
             )
-        
+            '''
+            # log_softmax는 vocab 차원으로 수행해야 함
+            log_probs = F.log_softmax(logits, dim=-1)  # (T, B, V)
+        # nll_loss input: (N, C) or (N, C, d1, ...) 형태 가능
+            # 여기서는 (T*B, V) 로 flatten
+            nll_loss = F.nll_loss(
+                log_probs.reshape(-1, metadata.vocab_size),     # (T*B, V)
+                target_label_forloss.reshape(-1),               # (T*B,)
+                ignore_index=-100
+            )
+
+            # 유효 위치 마스크: target != -100
+            mask = (target_label_forloss != -100).float()  # (T,B)
+            loss = (nll_loss * mask).sum() / mask.sum().clamp_min(1.0)
+
         # Check for NaN/Inf
         if not torch.isfinite(loss):
             print(f"\n⚠️  WARNING: Non-finite loss detected at batch {batch_idx}!")
@@ -658,8 +662,8 @@ def train(model, optimizer, train_iter, metadata, grad_clip, reverse_src=False,
             grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
 
             optimizer.step()
-            summarize_delta(wen_before, model.encoder.rnn.weight_ih_l0, name="enc weight_ih_l0", eps=1e-12)
-            summarize_delta(wdn_before, model.decoder.rnn.weight_ih_l0, name="dec weight_ih_l0", eps=1e-12)
+            #summarize_delta(wen_before, model.encoder.rnn.weight_ih_l0, name="enc weight_ih_l0", eps=1e-12)
+            #summarize_delta(wdn_before, model.decoder.rnn.weight_ih_l0, name="dec weight_ih_l0", eps=1e-12)
             #print("after updating -- encoder embed :",model.encoder.embed.weight[2][:20])
             #print("grad nonzero count:",count_nonzero_grad_vocab(model.encoder.embed.weight.grad))
             #print("after updating -- decoder embed :",model.decoder.embed.weight[2][:20])
